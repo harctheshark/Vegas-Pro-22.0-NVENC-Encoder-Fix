@@ -1,0 +1,17 @@
+; Export surface of the shim: identical to the real nvEncodeAPI64.dll.
+;
+; Ordinals are pinned to match the driver DLL's own ordinal assignment, so a
+; caller that resolves by ordinal rather than by name still lands on the right
+; function.
+LIBRARY nvEncodeAPI64
+EXPORTS
+    NvEncodeAPICreateInstance         @1
+    NvEncodeAPIGetMaxSupportedVersion @2
+    NvToolCreateInterface             @3
+    NvToolDestroyInterface            @4
+    NvToolGetApiFunctionCount         @5
+    NvToolGetApiID                    @6
+    NvToolGetApiNames                 @7
+    NvToolGetInterface                @8
+    NvToolSetApiID                    @9
+    NvToolSetInterface                @10
