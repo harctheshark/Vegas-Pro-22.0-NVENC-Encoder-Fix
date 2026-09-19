@@ -45,6 +45,7 @@ set "CFLAGS=/nologo /O2 /W3 /MT /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /Ithird_party
 if /i "%TARGET%"=="probe" goto :probe
 if /i "%TARGET%"=="dll"   goto :dll
 if /i "%TARGET%"=="all"   goto :dll
+if /i "%TARGET%"=="cuda"  goto :dll
 echo Unknown target "%TARGET%"
 goto :fail
 
@@ -88,6 +89,25 @@ if errorlevel 1 goto :fail
 echo.
 echo === building cuda_devices.exe ===
 cl %CFLAGS% tools\cuda_devices.c /Fe:build\cuda_devices.exe /Fo:build\ /Fd:build\
+if errorlevel 1 goto :fail
+
+rem The nvcuda proxy is a diagnostic, built only on request: build.cmd cuda
+if /i not "%TARGET%"=="cuda" goto :done
+
+:cuda
+echo.
+echo === generating nvcuda pass-through layer ===
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\gen_cuda_thunks.ps1
+if errorlevel 1 goto :fail
+
+echo.
+echo === assembling nvcuda thunks ===
+ml64 /nologo /c /Fo build\nvcuda_thunks.obj src\generated\nvcuda_thunks.asm
+if errorlevel 1 goto :fail
+
+echo.
+echo === building nvcuda.dll (diagnostic proxy) ===
+cl %CFLAGS% /Isrc /LD src\nvcuda_shim.c build\nvcuda_thunks.obj /Fe:build\nvcuda.dll /Fo:build\ /Fd:build\ /link /DEF:src\generated\nvcuda_shim.def /OUT:build\nvcuda.dll kernel32.lib
 if errorlevel 1 goto :fail
 
 :done

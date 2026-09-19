@@ -6,3 +6,4 @@ build/
 *.ilk
 *.log
 .bak/
+src/generated/
