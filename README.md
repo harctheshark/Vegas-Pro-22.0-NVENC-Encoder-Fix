@@ -1,11 +1,68 @@
 # vegas-nvenc-fix
 
-A compatibility shim that fixes **VEGAS Pro render error `0x80660008 (message missing)`**
-on recent NVIDIA drivers, by restoring the NVENC preset API that NVIDIA removed.
+**Fixes `Error 0x80660008 (message missing)` when rendering with NV Encoder in
+VEGAS Pro**, on NVIDIA drivers 591.x and newer — without rolling back your driver
+and without replacing your encoder.
 
-No VEGAS file is patched. No NVIDIA file is patched or redistributed. The fix is a
-single proxy DLL that sits next to `vegas220.exe`, forwards everything to the real
-driver, and repairs the two calls that a decade-old NVENC client can no longer make.
+Symptoms this fixes:
+
+* Rendering with **Encode mode: NV Encoder** fails instantly
+* The **Preset** dropdown in Custom Settings is **empty**
+* CPU / MainConcept rendering still works fine
+
+> NVIDIA removed the legacy NVENC encode presets in the R590 driver branch, on
+> purpose. VEGAS Pro 17–22 ask for those presets and nothing else, so the encoder
+> is rejected before it starts. MAGIX has patched its 2026-line products and has
+> said older versions will not be updated, so there is no official fix coming for
+> VEGAS 22 or earlier. This restores the missing presets at runtime.
+
+---
+
+## Quick start
+
+1. Download the latest release and unzip it anywhere.
+2. **Close VEGAS.**
+3. Double-click **`install.cmd`**.
+
+That's it. It asks for administrator rights itself, finds VEGAS on whichever drive
+it lives on, and installs. No paths to type, no PowerShell, no Visual Studio.
+
+Then in VEGAS: **Render As → MAGIX AVC/AAC MP4 → Customize Template →
+Encode mode: `NV Encoder` → Preset: `High quality`**.
+
+To remove it again, double-click **`uninstall.cmd`**.
+
+<details>
+<summary>Building from source instead</summary>
+
+Needs Visual Studio 2022 (or Build Tools) with **Desktop development with C++**.
+
+```bat
+scripts\build.cmd
+install.cmd
+```
+
+`install.cmd` builds automatically if no prebuilt DLL is present.
+</details>
+
+<details>
+<summary>VEGAS installed somewhere unusual</summary>
+
+Detection checks the uninstall registry, any running VEGAS, Program Files, and
+common folders on every fixed drive. If yours is somewhere else entirely:
+
+```bat
+install.cmd "D:\Wherever\VEGAS Pro 22.0"
+```
+</details>
+
+---
+
+## What it does
+
+No VEGAS file is modified on disk. No NVIDIA file is patched or redistributed. The
+fix is a single proxy DLL that sits next to `vegas220.exe`, forwards everything to
+the real driver, and repairs the calls a decade-old NVENC client can no longer make.
 
 ---
 
