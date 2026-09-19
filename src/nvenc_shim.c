@@ -4,27 +4,33 @@
 //
 // WHAT IS BROKEN
 // --------------
-// VEGAS Pro's MAGIX AVC/AAC MP4 renderer (mxavcaacplug.dll) drives NVENC as an
-// SDK 7.1 client: it passes function-list version 0x71020007 and 7.1-era
-// version stamps on every API struct. Recent NVIDIA driver branches reject
-// those stamps. Measured on driver 616.92:
+// NVIDIA Video Codec SDK 13.x removed the legacy encode presets
+// (NV_ENC_PRESET_DEFAULT/HP/HQ/BD/LOW_LATENCY_*/LOSSLESS_*). VEGAS Pro's MAGIX
+// AVC/AAC MP4 renderer (mxavcaacplug.dll) references only those GUIDs, so on an
+// affected driver its preset lookup fails and the render aborts, which VEGAS
+// reports as "Error 0x80660008 (message missing)". Measured on driver 616.92:
 //
-//   nvEncOpenEncodeSessionEx, struct ver 7.1  -> NV_ENC_ERR_INVALID_VERSION
-//   nvEncOpenEncodeSessionEx, struct ver 13.1 -> NV_ENC_SUCCESS
+//   nvEncGetEncodePresetConfig(<any legacy GUID>) -> NV_ENC_ERR_UNSUPPORTED_PARAM
+//   nvEncGetEncodePresetConfigEx(P1..P7, tuning)  -> NV_ENC_SUCCESS
 //
-// and crossing the two version fields shows that only NV_ENC_*::version is
-// checked - NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS::apiVersion is not:
+// Translating the preset is not by itself enough. mxavcaacplug.dll drives NVENC
+// as an SDK 7.1 client - function-list version 0x71020007, and 7.1-era version
+// stamps on every struct - and the replacement API refuses those stamps:
+//
+//   nvEncGetEncodePresetConfigEx, 7.1-stamped structs -> ERR_INVALID_VERSION
+//   nvEncGetEncodePresetConfigEx, current stamps      -> SUCCESS
+//
+// so a shim that only swapped the GUID would have the translated call rejected
+// for its version instead. Crossing the two version fields shows that only
+// NV_ENC_*::version is checked, never ::apiVersion:
 //
 //   struct 13.1 + api 7.1 -> SUCCESS     struct 7.1 + api 13.1 -> INVALID_VERSION
 //
-// So VEGAS cannot open an encode session at all. It never reaches a preset
-// call, which is why the preset list in Custom Settings is empty and why the
-// render aborts as "Error 0x80660008 (message missing)".
-//
-// Behind that sits a second, independent break: SDK 13.x also removed the
-// legacy encode presets (NV_ENC_PRESET_DEFAULT/HP/HQ/BD/LOW_LATENCY_*/
-// LOSSLESS_*), and mxavcaacplug.dll references only those GUIDs. Repairing the
-// version stamps alone would just move the failure one step later.
+// A trap worth recording: the driver latches a client API version per PROCESS
+// at NvEncodeAPICreateInstance. A probe that creates a current-version instance
+// before testing an old client will see 7.1 stamps rejected everywhere and
+// conclude, wrongly, that old clients cannot open a session at all. Tested in
+// the right order, a 7.1 session opens fine. The presets are the real break.
 //
 // WHAT THIS DOES
 // --------------
@@ -62,7 +68,7 @@
 #include "nvenc_deprecated_presets.h"
 #include "nvenc_preset_map.h"
 
-#define VNF_VERSION "1.1.0"
+#define VNF_VERSION "1.2.0"
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
@@ -310,7 +316,12 @@ static NVENCSTATUS NVENCAPI vnf_GetEncodeCaps(void *e, GUID codec, NV_ENC_CAPS_P
     vnf_ver_set(&v, caps, NV_ENC_CAPS_PARAM_VER);
     NVENCSTATUS st = g_real.nvEncGetEncodeCaps(e, codec, caps, val);
     vnf_ver_restore(&v);
-    VNF_TRACE(st, "GetEncodeCaps -> %s", vnf_status(st));
+    // Which capability was asked for, and the answer: a host that gives up here
+    // usually did so because one specific cap came back smaller than it wanted.
+    vnf_log(1, "GetEncodeCaps(%s, cap=%d) -> %s, value=%d",
+            IsEqualGUID(&codec, &NV_ENC_CODEC_HEVC_GUID) ? "HEVC" :
+            IsEqualGUID(&codec, &NV_ENC_CODEC_H264_GUID) ? "H.264" : "other",
+            caps ? (int)caps->capsToQuery : -1, vnf_status(st), val ? *val : -1);
     return st;
 }
 
@@ -469,6 +480,118 @@ VNF_SIMPLE_HOOK(vnf_UnregisterAsyncEvent,    nvEncUnregisterAsyncEvent,    NV_EN
 VNF_SIMPLE_HOOK(vnf_GetSequenceParams,       nvEncGetSequenceParams,       NV_ENC_SEQUENCE_PARAM_PAYLOAD,  NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER)
 VNF_SIMPLE_HOOK(vnf_RunMotionEstimationOnly, nvEncRunMotionEstimationOnly, NV_ENC_MEONLY_PARAMS,           NV_ENC_MEONLY_PARAMS_VER)
 
+// ------------------------------------------------------- full call tracing --
+//
+// The setup path is traced on every call rather than only the first, because
+// the useful diagnostic is the *sequence*: where a host stops is what tells you
+// which call defeated it. The per-frame hooks above stay on first-call-plus-
+// failures so they cannot flood the log.
+
+static void vnf_log_guid(const char *what, const GUID *g)
+{
+    const char *known = "";
+    if (IsEqualGUID(g, &NV_ENC_CODEC_H264_GUID))      known = " (H.264)";
+    else if (IsEqualGUID(g, &NV_ENC_CODEC_HEVC_GUID)) known = " (HEVC)";
+    else if (IsEqualGUID(g, &NV_ENC_CODEC_AV1_GUID))  known = " (AV1)";
+    vnf_log(1, "    %s {%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}%s",
+            what, (unsigned long)g->Data1, g->Data2, g->Data3,
+            g->Data4[0], g->Data4[1], g->Data4[2], g->Data4[3],
+            g->Data4[4], g->Data4[5], g->Data4[6], g->Data4[7], known);
+}
+
+static NVENCSTATUS NVENCAPI vnf_OpenEncodeSession(void *device, uint32_t deviceType, void **encoder)
+{
+    NVENCSTATUS st = g_real.nvEncOpenEncodeSession(device, deviceType, encoder);
+    vnf_log(1, "OpenEncodeSession (legacy, deviceType=%u) -> %s", deviceType, vnf_status(st));
+    return st;
+}
+
+static NVENCSTATUS NVENCAPI vnf_GetEncodeGUIDCount(void *e, uint32_t *count)
+{
+    NVENCSTATUS st = g_real.nvEncGetEncodeGUIDCount(e, count);
+    vnf_log(1, "GetEncodeGUIDCount -> %s, count=%u", vnf_status(st), count ? *count : 0);
+    return st;
+}
+
+static NVENCSTATUS NVENCAPI vnf_GetEncodeGUIDs(void *e, GUID *guids, uint32_t size, uint32_t *count)
+{
+    NVENCSTATUS st = g_real.nvEncGetEncodeGUIDs(e, guids, size, count);
+    vnf_log(1, "GetEncodeGUIDs(size=%u) -> %s, count=%u", size, vnf_status(st), count ? *count : 0);
+    if (st == NV_ENC_SUCCESS && guids && count)
+        for (uint32_t i = 0; i < *count && i < 8; i++) vnf_log_guid("codec", &guids[i]);
+    return st;
+}
+
+static NVENCSTATUS NVENCAPI vnf_GetEncodeProfileGUIDCount(void *e, GUID codec, uint32_t *count)
+{
+    NVENCSTATUS st = g_real.nvEncGetEncodeProfileGUIDCount(e, codec, count);
+    vnf_log(1, "GetEncodeProfileGUIDCount -> %s, count=%u", vnf_status(st), count ? *count : 0);
+    return st;
+}
+
+static NVENCSTATUS NVENCAPI vnf_GetEncodeProfileGUIDs(void *e, GUID codec, GUID *guids,
+                                                      uint32_t size, uint32_t *count)
+{
+    NVENCSTATUS st = g_real.nvEncGetEncodeProfileGUIDs(e, codec, guids, size, count);
+    vnf_log(1, "GetEncodeProfileGUIDs(size=%u) -> %s, count=%u", size, vnf_status(st),
+            count ? *count : 0);
+    return st;
+}
+
+static NVENCSTATUS NVENCAPI vnf_GetInputFormatCount(void *e, GUID codec, uint32_t *count)
+{
+    NVENCSTATUS st = g_real.nvEncGetInputFormatCount(e, codec, count);
+    vnf_log(1, "GetInputFormatCount -> %s, count=%u", vnf_status(st), count ? *count : 0);
+    return st;
+}
+
+static NVENCSTATUS NVENCAPI vnf_GetInputFormats(void *e, GUID codec, NV_ENC_BUFFER_FORMAT *fmts,
+                                                uint32_t size, uint32_t *count)
+{
+    NVENCSTATUS st = g_real.nvEncGetInputFormats(e, codec, fmts, size, count);
+    vnf_log(1, "GetInputFormats(size=%u) -> %s, count=%u", size, vnf_status(st),
+            count ? *count : 0);
+    return st;
+}
+
+static NVENCSTATUS NVENCAPI vnf_DestroyEncoder(void *e)
+{
+    NVENCSTATUS st = g_real.nvEncDestroyEncoder(e);
+    vnf_log(1, "DestroyEncoder -> %s", vnf_status(st));
+    return st;
+}
+
+static const char *NVENCAPI vnf_GetLastErrorString(void *e)
+{
+    const char *s = g_real.nvEncGetLastErrorString(e);
+    // The host only asks for this after something went wrong, so it is the
+    // driver's own account of the failure - always worth recording.
+    vnf_log(1, "GetLastErrorString -> \"%s\"", s ? s : "(null)");
+    return s;
+}
+
+static NVENCSTATUS NVENCAPI vnf_GetEncodeStats(void *e, NV_ENC_STAT *p)
+{
+    vnf_ver_save v;
+    vnf_ver_set(&v, p, NV_ENC_STAT_VER);
+    NVENCSTATUS st = g_real.nvEncGetEncodeStats(e, p);
+    vnf_ver_restore(&v);
+    VNF_TRACE(st, "GetEncodeStats -> %s", vnf_status(st));
+    return st;
+}
+
+static NVENCSTATUS NVENCAPI vnf_GetSequenceParamEx(void *e, NV_ENC_INITIALIZE_PARAMS *ip,
+                                                   NV_ENC_SEQUENCE_PARAM_PAYLOAD *pl)
+{
+    vnf_ver_save vi, vp;
+    vnf_ver_set(&vi, ip, NV_ENC_INITIALIZE_PARAMS_VER);
+    vnf_ver_set(&vp, pl, NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER);
+    NVENCSTATUS st = g_real.nvEncGetSequenceParamEx(e, ip, pl);
+    vnf_ver_restore(&vp); vnf_ver_restore(&vi);
+    VNF_TRACE(st, "GetSequenceParamEx -> %s", vnf_status(st));
+    return st;
+}
+
 // ----------------------------------------------------------------- exports --
 
 NVENCSTATUS NVENCAPI NvEncodeAPIGetMaxSupportedVersion(uint32_t *version)
@@ -507,7 +630,18 @@ NVENCSTATUS NVENCAPI NvEncodeAPICreateInstance(NV_ENCODE_API_FUNCTION_LIST *func
             asked, asked & 0xFF, (asked >> 24) & 0x0F,
             NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION);
 
+    functionList->nvEncOpenEncodeSession       = vnf_OpenEncodeSession;
     functionList->nvEncOpenEncodeSessionEx     = vnf_OpenEncodeSessionEx;
+    functionList->nvEncGetEncodeGUIDCount      = vnf_GetEncodeGUIDCount;
+    functionList->nvEncGetEncodeGUIDs          = vnf_GetEncodeGUIDs;
+    functionList->nvEncGetEncodeProfileGUIDCount = vnf_GetEncodeProfileGUIDCount;
+    functionList->nvEncGetEncodeProfileGUIDs   = vnf_GetEncodeProfileGUIDs;
+    functionList->nvEncGetInputFormatCount     = vnf_GetInputFormatCount;
+    functionList->nvEncGetInputFormats         = vnf_GetInputFormats;
+    functionList->nvEncDestroyEncoder          = vnf_DestroyEncoder;
+    functionList->nvEncGetLastErrorString      = vnf_GetLastErrorString;
+    functionList->nvEncGetEncodeStats          = vnf_GetEncodeStats;
+    functionList->nvEncGetSequenceParamEx      = vnf_GetSequenceParamEx;
     functionList->nvEncGetEncodeCaps           = vnf_GetEncodeCaps;
     functionList->nvEncGetEncodePresetConfig   = vnf_GetEncodePresetConfig;
     functionList->nvEncGetEncodePresetConfigEx = vnf_GetEncodePresetConfigEx;
