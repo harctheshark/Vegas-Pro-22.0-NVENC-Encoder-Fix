@@ -69,7 +69,7 @@
 #include "nvenc_deprecated_presets.h"
 #include "nvenc_preset_map.h"
 
-#define VNF_VERSION "1.7.2"
+#define VNF_VERSION "1.8.0"
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
@@ -838,6 +838,47 @@ static void vnf_arm_traps(void)
             }
         } else {
             vnf_log(1, "tag: preset-not-found constant not recognised - left alone");
+        }
+    }
+
+    // ---- THE FIX -------------------------------------------------------
+    // sub_18004AF80 asks the driver to enumerate presets and linearly scans
+    // the result for the GUID stored in the render template. The removed
+    // legacy GUIDs are not in the driver's list, so the scan fails and the
+    // function returns NV_ENC_ERR_INVALID_PARAM before the encoder is ever
+    // configured. Measured: the host reported 0x8066055A, the tagged value
+    // for exactly this branch.
+    //
+    //     0x4B10D  45 85 F6   test r14d,r14d      ; r14d = 1 if the GUID matched
+    //     0x4B110  74 5D      je   0x4B16F        ; no match -> mov ebp,8 -> error
+    //
+    // Two bytes of NOP remove the rejection, and the preset the host asked for
+    // is then resolved by this shim's GetEncodePresetConfig, which cannot fail:
+    // a legacy GUID is translated per NVIDIA's migration table, anything
+    // unrecognised falls back to P4 with high-quality tuning. The check is
+    // being removed because the shim has made it unnecessary, not to paper
+    // over it.
+    //
+    // This is an in-memory patch to the loaded copy. Nothing on disk is
+    // modified, so uninstalling the shim reverts it completely.
+    if (GetEnvironmentVariableW(L"VEGAS_NVENC_FIX_PATCH", buf, 8) > 0 && buf[0] == L'0') {
+        vnf_log(1, "fix: VEGAS_NVENC_FIX_PATCH=0 -> preset-check patch NOT applied");
+    } else {
+        BYTE *p = (BYTE *)m + 0x4B10D;
+        if (p[0] == 0x45 && p[1] == 0x85 && p[2] == 0xF6 && p[3] == 0x74 && p[4] == 0x5D) {
+            DWORD old;
+            if (VirtualProtect(p + 3, 2, PAGE_EXECUTE_READWRITE, &old)) {
+                p[3] = 0x90; p[4] = 0x90;          // je -> nop nop
+                VirtualProtect(p + 3, 2, old, &old);
+                FlushInstructionCache(GetCurrentProcess(), p + 3, 2);
+                vnf_log(1, "fix: preset-not-found rejection removed at +0x4B110 (je -> nop nop)");
+            } else {
+                vnf_log(1, "fix: VirtualProtect failed at +0x4B110 - NOT patched");
+            }
+        } else {
+            vnf_log(1, "fix: bytes at +0x4B10D are %02X %02X %02X %02X %02X, not the expected "
+                       "45 85 F6 74 5D - NOT patched (different plugin build)",
+                    p[0], p[1], p[2], p[3], p[4]);
         }
     }
 
