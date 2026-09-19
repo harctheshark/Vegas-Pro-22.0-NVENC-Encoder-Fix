@@ -85,6 +85,11 @@ echo === building dbgcapture.exe ===
 cl %CFLAGS% tools\dbgcapture.c /Fe:build\dbgcapture.exe /Fo:build\ /Fd:build\ /link advapi32.lib
 if errorlevel 1 goto :fail
 
+echo.
+echo === building cuda_devices.exe ===
+cl %CFLAGS% tools\cuda_devices.c /Fe:build\cuda_devices.exe /Fo:build\ /Fd:build\
+if errorlevel 1 goto :fail
+
 :done
 echo.
 echo === build complete -^> %ROOT%\build ===
