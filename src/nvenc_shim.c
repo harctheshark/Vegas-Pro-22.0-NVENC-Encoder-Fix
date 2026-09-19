@@ -69,7 +69,7 @@
 #include "nvenc_deprecated_presets.h"
 #include "nvenc_preset_map.h"
 
-#define VNF_VERSION "1.7.1"
+#define VNF_VERSION "1.7.2"
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
@@ -820,6 +820,27 @@ static void vnf_arm_traps(void)
         tagged++;
     }
 
+    // Site 5 (0x4B174) is reached three ways and cannot be told apart from the
+    // HRESULT alone: GetEncodePresetCount failed (0x4AFE7), GetEncodePresetGUIDs
+    // failed (0x4B0A7), or the GUID scan found no match (0x4B16F, "mov ebp,8").
+    // Retag that last constant so the no-match case reports ss=5A instead of 08.
+    // 0x8066055A therefore means "preset not in the enumerated list", while
+    // 0x80660508 means one of the two enumeration calls returned 8.
+    {
+        BYTE *p = (BYTE *)m + 0x4B16F;
+        if (p[0] == 0xBD && p[1] == 0x08 && p[2] == 0x00 && p[3] == 0x00 && p[4] == 0x00) {
+            DWORD old;
+            if (VirtualProtect(p + 1, 1, PAGE_EXECUTE_READWRITE, &old)) {
+                p[1] = 0x5A;
+                VirtualProtect(p + 1, 1, old, &old);
+                FlushInstructionCache(GetCurrentProcess(), p + 1, 1);
+                vnf_log(1, "tag: preset-not-found constant retagged 8 -> 0x5A");
+            }
+        } else {
+            vnf_log(1, "tag: preset-not-found constant not recognised - left alone");
+        }
+    }
+
     vnf_log(1, "tag: marked %d of %d error sites (%d skipped)",
             tagged, VNF_TRAP_COUNT, skipped);
     vnf_log(1, "     the reported error becomes 0x8066NNss - NN = site, ss = NVENCSTATUS:");
@@ -902,6 +923,17 @@ NVENCSTATUS NVENCAPI NvEncodeAPICreateInstance(NV_ENCODE_API_FUNCTION_LIST *func
     functionList->nvEncUnregisterAsyncEvent    = vnf_UnregisterAsyncEvent;
     functionList->nvEncGetSequenceParams       = vnf_GetSequenceParams;
     functionList->nvEncRunMotionEstimationOnly = vnf_RunMotionEstimationOnly;
+
+    // Read the slots back. The host reached an error site that is only
+    // reachable through nvEncGetEncodePresetCount, yet that hook logged
+    // nothing. Prove per table whether the hooks really are in the table the
+    // host keeps, and record its address so a second table would be obvious.
+    vnf_log(1, "hook check @ table %p: presetCount=%s presetGUIDs=%s presetConfig=%s init=%s",
+            (void *)functionList,
+            functionList->nvEncGetEncodePresetCount  == vnf_GetEncodePresetCount  ? "ours" : "NOT-OURS",
+            functionList->nvEncGetEncodePresetGUIDs  == vnf_GetEncodePresetGUIDs  ? "ours" : "NOT-OURS",
+            functionList->nvEncGetEncodePresetConfig == vnf_GetEncodePresetConfig ? "ours" : "NOT-OURS",
+            functionList->nvEncInitializeEncoder     == vnf_InitializeEncoder     ? "ours" : "NOT-OURS");
 
     return NV_ENC_SUCCESS;
 }
