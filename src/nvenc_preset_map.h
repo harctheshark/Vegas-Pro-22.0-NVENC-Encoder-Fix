@@ -44,30 +44,62 @@ typedef struct {
     const char        *name;     // for logging
 } vnf_preset_row;
 
-// ---- H.264 (NVIDIA Table 2, Ampere/Turing, 1080p) ------------------------
-static const vnf_preset_row VNF_MAP_H264[] = {
-    { &VNF_NV_ENC_PRESET_HP_GUID,                  &NV_ENC_PRESET_P2_GUID, 2, NV_ENC_TUNING_INFO_HIGH_QUALITY, "HP" },
-    { &VNF_NV_ENC_PRESET_DEFAULT_GUID,             &NV_ENC_PRESET_P3_GUID, 3, NV_ENC_TUNING_INFO_HIGH_QUALITY, "DEFAULT" },
-    { &VNF_NV_ENC_PRESET_HQ_GUID,                  &NV_ENC_PRESET_P4_GUID, 4, NV_ENC_TUNING_INFO_HIGH_QUALITY, "HQ" },
-    { &VNF_NV_ENC_PRESET_BD_GUID,                  &NV_ENC_PRESET_P4_GUID, 4, NV_ENC_TUNING_INFO_HIGH_QUALITY, "BD" },
-    { &VNF_NV_ENC_PRESET_LOW_LATENCY_HP_GUID,      &NV_ENC_PRESET_P2_GUID, 2, NV_ENC_TUNING_INFO_LOW_LATENCY,  "LOW_LATENCY_HP" },
-    { &VNF_NV_ENC_PRESET_LOW_LATENCY_DEFAULT_GUID, &NV_ENC_PRESET_P3_GUID, 3, NV_ENC_TUNING_INFO_LOW_LATENCY,  "LOW_LATENCY_DEFAULT" },
-    { &VNF_NV_ENC_PRESET_LOW_LATENCY_HQ_GUID,      &NV_ENC_PRESET_P4_GUID, 4, NV_ENC_TUNING_INFO_LOW_LATENCY,  "LOW_LATENCY_HQ" },
-    { &VNF_NV_ENC_PRESET_LOSSLESS_HP_GUID,         &NV_ENC_PRESET_P2_GUID, 2, NV_ENC_TUNING_INFO_LOSSLESS,     "LOSSLESS_HP" },
-    { &VNF_NV_ENC_PRESET_LOSSLESS_DEFAULT_GUID,    &NV_ENC_PRESET_P3_GUID, 3, NV_ENC_TUNING_INFO_LOSSLESS,     "LOSSLESS_DEFAULT" },
-};
+// ---- The mapping actually used -------------------------------------------
+//
+// NVIDIA's migration tables exist to REPRODUCE a legacy preset's old
+// behaviour. That was the right target while the goal was compatibility, and
+// it is why an earlier version of this file mapped "High quality" to P4 and
+// spread the rest over P2..P5, differing per codec.
+//
+// It is the wrong target now. The host is working again, so the only thing
+// these names have to do is describe what the user is going to get. NVENC
+// separates the two axes cleanly, and the mapping below follows that split:
+//
+//     preset P1..P7  = speed / quality, P1 fastest, P7 best
+//     tuning info    = what the encode is FOR
+//
+// So each legacy family keeps its tuning, and the three words the host puts in
+// its dropdown - "high performance", "default", "high quality" - select the
+// point on the P scale they claim to select:
+//
+//     high performance -> P1      fastest
+//     default          -> P4      balanced, NVIDIA's own middle
+//     high quality     -> P6      slower, visibly better at a given bitrate
+//     BD               -> P5      between default and high quality
+//
+// Both codecs use the same numbers deliberately. NVIDIA's tables map the same
+// legacy name to different P values for H.264 and HEVC, which was correct for
+// reproducing old output but would mean "High quality" quietly meaning two
+// different things depending on the format chosen. Accuracy of the label wins.
+//
+// P6 rather than P7 for high quality is the user's call and a sensible one:
+// P7 costs noticeably more encode time for a small gain, and at a generous
+// bitrate the difference is hard to see. Changing it is a one-line edit here.
 
-// ---- HEVC (NVIDIA Table 1, Ampere/Turing, 1080p) -------------------------
-static const vnf_preset_row VNF_MAP_HEVC[] = {
+// ---- H.264 ---------------------------------------------------------------
+static const vnf_preset_row VNF_MAP_H264[] = {
     { &VNF_NV_ENC_PRESET_HP_GUID,                  &NV_ENC_PRESET_P1_GUID, 1, NV_ENC_TUNING_INFO_HIGH_QUALITY, "HP" },
-    { &VNF_NV_ENC_PRESET_DEFAULT_GUID,             &NV_ENC_PRESET_P5_GUID, 5, NV_ENC_TUNING_INFO_HIGH_QUALITY, "DEFAULT" },
+    { &VNF_NV_ENC_PRESET_DEFAULT_GUID,             &NV_ENC_PRESET_P4_GUID, 4, NV_ENC_TUNING_INFO_HIGH_QUALITY, "DEFAULT" },
     { &VNF_NV_ENC_PRESET_HQ_GUID,                  &NV_ENC_PRESET_P6_GUID, 6, NV_ENC_TUNING_INFO_HIGH_QUALITY, "HQ" },
     { &VNF_NV_ENC_PRESET_BD_GUID,                  &NV_ENC_PRESET_P5_GUID, 5, NV_ENC_TUNING_INFO_HIGH_QUALITY, "BD" },
-    { &VNF_NV_ENC_PRESET_LOW_LATENCY_HP_GUID,      &NV_ENC_PRESET_P2_GUID, 2, NV_ENC_TUNING_INFO_LOW_LATENCY,  "LOW_LATENCY_HP" },
-    { &VNF_NV_ENC_PRESET_LOW_LATENCY_DEFAULT_GUID, &NV_ENC_PRESET_P3_GUID, 3, NV_ENC_TUNING_INFO_LOW_LATENCY,  "LOW_LATENCY_DEFAULT" },
-    { &VNF_NV_ENC_PRESET_LOW_LATENCY_HQ_GUID,      &NV_ENC_PRESET_P4_GUID, 4, NV_ENC_TUNING_INFO_LOW_LATENCY,  "LOW_LATENCY_HQ" },
-    { &VNF_NV_ENC_PRESET_LOSSLESS_HP_GUID,         &NV_ENC_PRESET_P3_GUID, 3, NV_ENC_TUNING_INFO_LOSSLESS,     "LOSSLESS_HP" },
-    { &VNF_NV_ENC_PRESET_LOSSLESS_DEFAULT_GUID,    &NV_ENC_PRESET_P5_GUID, 5, NV_ENC_TUNING_INFO_LOSSLESS,     "LOSSLESS_DEFAULT" },
+    { &VNF_NV_ENC_PRESET_LOW_LATENCY_HP_GUID,      &NV_ENC_PRESET_P1_GUID, 1, NV_ENC_TUNING_INFO_LOW_LATENCY,  "LOW_LATENCY_HP" },
+    { &VNF_NV_ENC_PRESET_LOW_LATENCY_DEFAULT_GUID, &NV_ENC_PRESET_P4_GUID, 4, NV_ENC_TUNING_INFO_LOW_LATENCY,  "LOW_LATENCY_DEFAULT" },
+    { &VNF_NV_ENC_PRESET_LOW_LATENCY_HQ_GUID,      &NV_ENC_PRESET_P6_GUID, 6, NV_ENC_TUNING_INFO_LOW_LATENCY,  "LOW_LATENCY_HQ" },
+    { &VNF_NV_ENC_PRESET_LOSSLESS_HP_GUID,         &NV_ENC_PRESET_P1_GUID, 1, NV_ENC_TUNING_INFO_LOSSLESS,     "LOSSLESS_HP" },
+    { &VNF_NV_ENC_PRESET_LOSSLESS_DEFAULT_GUID,    &NV_ENC_PRESET_P4_GUID, 4, NV_ENC_TUNING_INFO_LOSSLESS,     "LOSSLESS_DEFAULT" },
+};
+
+// ---- HEVC (same numbers, so a name means one thing) ----------------------
+static const vnf_preset_row VNF_MAP_HEVC[] = {
+    { &VNF_NV_ENC_PRESET_HP_GUID,                  &NV_ENC_PRESET_P1_GUID, 1, NV_ENC_TUNING_INFO_HIGH_QUALITY, "HP" },
+    { &VNF_NV_ENC_PRESET_DEFAULT_GUID,             &NV_ENC_PRESET_P4_GUID, 4, NV_ENC_TUNING_INFO_HIGH_QUALITY, "DEFAULT" },
+    { &VNF_NV_ENC_PRESET_HQ_GUID,                  &NV_ENC_PRESET_P6_GUID, 6, NV_ENC_TUNING_INFO_HIGH_QUALITY, "HQ" },
+    { &VNF_NV_ENC_PRESET_BD_GUID,                  &NV_ENC_PRESET_P5_GUID, 5, NV_ENC_TUNING_INFO_HIGH_QUALITY, "BD" },
+    { &VNF_NV_ENC_PRESET_LOW_LATENCY_HP_GUID,      &NV_ENC_PRESET_P1_GUID, 1, NV_ENC_TUNING_INFO_LOW_LATENCY,  "LOW_LATENCY_HP" },
+    { &VNF_NV_ENC_PRESET_LOW_LATENCY_DEFAULT_GUID, &NV_ENC_PRESET_P4_GUID, 4, NV_ENC_TUNING_INFO_LOW_LATENCY,  "LOW_LATENCY_DEFAULT" },
+    { &VNF_NV_ENC_PRESET_LOW_LATENCY_HQ_GUID,      &NV_ENC_PRESET_P6_GUID, 6, NV_ENC_TUNING_INFO_LOW_LATENCY,  "LOW_LATENCY_HQ" },
+    { &VNF_NV_ENC_PRESET_LOSSLESS_HP_GUID,         &NV_ENC_PRESET_P1_GUID, 1, NV_ENC_TUNING_INFO_LOSSLESS,     "LOSSLESS_HP" },
+    { &VNF_NV_ENC_PRESET_LOSSLESS_DEFAULT_GUID,    &NV_ENC_PRESET_P4_GUID, 4, NV_ENC_TUNING_INFO_LOSSLESS,     "LOSSLESS_DEFAULT" },
 };
 
 #define VNF_MAP_COUNT ((int)(sizeof(VNF_MAP_H264) / sizeof(VNF_MAP_H264[0])))

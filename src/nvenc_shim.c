@@ -69,7 +69,7 @@
 #include "nvenc_deprecated_presets.h"
 #include "nvenc_preset_map.h"
 
-#define VNF_VERSION "1.9.0"
+#define VNF_VERSION "2.0.0"
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
@@ -463,9 +463,17 @@ static NVENCSTATUS NVENCAPI vnf_GetEncodePresetConfig(void *encoder, GUID encode
             useGuid = *row->modern;
             useTune = row->tuning;
             how     = row->name;
+        } else if (vnf_is_modern_preset(&presetGUID)) {
+            // A P1..P7 preset. This entry point predates them and the driver
+            // refuses it, but the caller asked for a specific preset and must
+            // get THAT one - substituting a different P here would silently
+            // hand back the wrong encoder settings.
+            useGuid = presetGUID;
+            useTune = NV_ENC_TUNING_INFO_HIGH_QUALITY;
+            how     = "modern preset via ...Ex";
         } else {
-            // Unrecognised preset. P4 + high quality is the middle of the
-            // modern range and what NVIDIA's guide maps H.264 "HQ" onto.
+            // Neither legacy nor modern - typically the all-zero GUID a
+            // template carries when its preset list could not be built.
             useGuid = NV_ENC_PRESET_P4_GUID;
             useTune = NV_ENC_TUNING_INFO_HIGH_QUALITY;
             how     = "UNKNOWN->P4 fallback";
@@ -820,16 +828,22 @@ static vnf_trap g_traps[] = {
 // no new code executed.
 static void vnf_arm_traps(void)
 {
-    WCHAR buf[8];
-    if (GetEnvironmentVariableW(L"VEGAS_NVENC_FIX_TRAP", buf, 8) > 0 && buf[0] == L'0') {
-        vnf_log(1, "VEGAS_NVENC_FIX_TRAP=0 -> error-site tagging disabled");
-        return;
-    }
-
     HMODULE m = GetModuleHandleA("mxavcaacplug.dll");
     if (!m) { vnf_log(1, "tag: mxavcaacplug.dll not loaded - nothing tagged"); return; }
 
+    // Error-site tagging is now OPT-IN. It rewrites the host's error constants
+    // so a failure reports 0x8066NNss instead of its real HRESULT, which was
+    // invaluable while hunting the failing check and is actively unhelpful
+    // afterwards: any future problem should surface its genuine code.
+    // Set VEGAS_NVENC_FIX_TRAP=1 to turn it back on.
+    WCHAR buf[8];
+    const int wantTag = (GetEnvironmentVariableW(L"VEGAS_NVENC_FIX_TRAP", buf, 8) > 0 && buf[0] == L'1');
+
     int tagged = 0, skipped = 0;
+    if (!wantTag) {
+        vnf_log(1, "tag: error-site tagging off (set VEGAS_NVENC_FIX_TRAP=1 to diagnose)");
+        goto patch_only;
+    }
     for (int i = 0; i < VNF_TRAP_COUNT; i++) {
         BYTE *p = (BYTE *)m + g_traps[i].rva;
         // Verify the whole constant, not just the opcode, so a different build
@@ -871,6 +885,7 @@ static void vnf_arm_traps(void)
         }
     }
 
+patch_only:
     // ---- THE FIX -------------------------------------------------------
     // sub_18004AF80 asks the driver to enumerate presets and linearly scans
     // the result for the GUID stored in the render template. The removed
@@ -912,12 +927,14 @@ static void vnf_arm_traps(void)
         }
     }
 
-    vnf_log(1, "tag: marked %d of %d error sites (%d skipped)",
-            tagged, VNF_TRAP_COUNT, skipped);
-    vnf_log(1, "     the reported error becomes 0x8066NNss - NN = site, ss = NVENCSTATUS:");
-    for (int i = 0; i < VNF_TRAP_COUNT; i++)
-        if (g_traps[i].addr)
-            vnf_log(1, "       NN=%02X  +0x%-6X %s", i + 1, g_traps[i].rva, g_traps[i].what);
+    if (wantTag) {
+        vnf_log(1, "tag: marked %d of %d error sites (%d skipped)",
+                tagged, VNF_TRAP_COUNT, skipped);
+        vnf_log(1, "     the reported error becomes 0x8066NNss - NN = site, ss = NVENCSTATUS:");
+        for (int i = 0; i < VNF_TRAP_COUNT; i++)
+            if (g_traps[i].addr)
+                vnf_log(1, "       NN=%02X  +0x%-6X %s", i + 1, g_traps[i].rva, g_traps[i].what);
+    }
 }
 
 // ----------------------------------------------------------------- exports --

@@ -154,25 +154,43 @@ across driver updates and rollbacks.
 
 ### Preset mapping
 
-From NVIDIA's *NVENC Preset Migration Guide* (Video Codec SDK 11.1, Tables 1 and
-2), using the Ampere/Turing column at 1080p. H.264 and HEVC genuinely differ:
+NVENC separates two axes, and the mapping follows that split:
 
-| Legacy preset | H.264 | HEVC | Tuning |
+* **preset P1…P7** — speed vs quality, P1 fastest, P7 best
+* **tuning info** — what the encode is *for*
+
+Each legacy family keeps its tuning, and the words the host shows in its dropdown
+select the point on the P scale they claim to select. Both codecs use the same
+numbers, so a given name means one thing:
+
+| VEGAS dropdown | Legacy GUID | Preset | Tuning |
 |---|---|---|---|
-| `HP` | P2 | P1 | High Quality |
-| `DEFAULT` | P3 | P5 | High Quality |
-| `HQ` | P4 | P6 | High Quality |
-| `BD` | P4 | P5 | High Quality |
-| `LOW_LATENCY_HP` | P2 | P2 | Low Latency |
-| `LOW_LATENCY_DEFAULT` | P3 | P3 | Low Latency |
-| `LOW_LATENCY_HQ` | P4 | P4 | Low Latency |
-| `LOSSLESS_HP` | P2 | P3 | Lossless |
-| `LOSSLESS_DEFAULT` | P3 | P5 | Lossless |
+| High performance | `HP` | **P1** | High Quality |
+| Default | `DEFAULT` | **P4** | High Quality |
+| **High quality** | `HQ` | **P6** | High Quality |
+| *(Blu-ray)* | `BD` | **P5** | High Quality |
+| Low latency · high performance | `LOW_LATENCY_HP` | **P1** | Low Latency |
+| Low latency · default | `LOW_LATENCY_DEFAULT` | **P4** | Low Latency |
+| Low latency · high quality | `LOW_LATENCY_HQ` | **P6** | Low Latency |
+| Lossless · high performance | `LOSSLESS_HP` | **P1** | Lossless |
+| Lossless · default | `LOSSLESS_DEFAULT` | **P4** | Lossless |
+
+**For file rendering, use "High quality" (P6).** The Low Latency tunings trade
+compression efficiency for encode latency, which only pays off when streaming;
+Lossless ignores your bitrate and produces enormous files.
+
+This deliberately departs from NVIDIA's *NVENC Preset Migration Guide*. Those
+tables map a legacy preset to whatever reproduces its **old** output — for H.264,
+`HQ` → P4 — and they differ per codec, so the same name would mean different
+things in AVC and HEVC. That is the right target for bit-compatibility and the
+wrong one here: the host is working again, so the names should describe what you
+actually get. P6 is better than anything VEGAS 22 could originally reach. Edit
+`src/nvenc_preset_map.h` to choose differently; P7 is the obvious alternative.
 
 The shim translates **preset identity only**. NVIDIA's tables also list multipass,
-GOP length and slice-mode columns for reproducing a legacy preset exactly; those
-are deliberately not applied, because VEGAS sets its own rate control, bitrate and
-GOP on the config it gets back. Forcing them would override your render settings.
+GOP length and slice-mode columns; those are deliberately not applied, because
+VEGAS sets its own rate control, bitrate and GOP on the config it gets back.
+Forcing them would override your render settings.
 
 ---
 
