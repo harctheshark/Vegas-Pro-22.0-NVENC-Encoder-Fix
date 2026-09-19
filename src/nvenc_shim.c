@@ -63,12 +63,13 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <intrin.h>
 
 #include "nvEncodeAPI.h"
 #include "nvenc_deprecated_presets.h"
 #include "nvenc_preset_map.h"
 
-#define VNF_VERSION "1.3.0"
+#define VNF_VERSION "1.4.0"
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
@@ -145,6 +146,28 @@ static const char *vnf_status(NVENCSTATUS s)
     case NV_ENC_ERR_GENERIC:             return "ERR_GENERIC";
     default:                             return "ERR_other";
     }
+}
+
+// Identifies the caller as "module.dll+0xoffset". Which module drives NVENC,
+// and the exact instruction it returns to, is what makes it possible to read
+// the host's decision logic in a disassembler rather than infer it from which
+// calls do and do not arrive.
+static void vnf_caller(char *out, size_t cch, void *retaddr)
+{
+    out[0] = '\0';
+    HMODULE mod = NULL;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)retaddr, &mod) || !mod) {
+        _snprintf_s(out, cch, _TRUNCATE, "?+%p", retaddr);
+        return;
+    }
+    char path[MAX_PATH] = "";
+    GetModuleFileNameA(mod, path, MAX_PATH);
+    const char *base = strrchr(path, '\\');
+    _snprintf_s(out, cch, _TRUNCATE, "%s+0x%llX",
+                base ? base + 1 : path,
+                (unsigned long long)((uintptr_t)retaddr - (uintptr_t)mod));
 }
 
 // Logs the first time a given call site is reached, and thereafter only on
@@ -315,9 +338,12 @@ static NVENCSTATUS NVENCAPI vnf_OpenEncodeSessionEx(NV_ENC_OPEN_ENCODE_SESSION_E
         case NV_ENC_DEVICE_TYPE_OPENGL:  dev = "OPENGL";  break;
         default:                         dev = "other";   break;
     }
-    vnf_log(1, "OpenEncodeSessionEx: device=%s apiVersion=0x%08X struct 0x%08X -> 0x%08X : %s",
-            dev, p ? p->apiVersion : 0, was,
+    char who[160];
+    vnf_caller(who, sizeof(who), _ReturnAddress());
+    vnf_log(1, "OpenEncodeSessionEx: device=%s ctx=%p apiVersion=0x%08X struct 0x%08X -> 0x%08X : %s",
+            dev, p ? p->device : NULL, p ? p->apiVersion : 0, was,
             (unsigned)NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER, vnf_status(st));
+    vnf_log(1, "    called from %s", who);
     return st;
 }
 
@@ -568,7 +594,9 @@ static NVENCSTATUS NVENCAPI vnf_GetInputFormats(void *e, GUID codec, NV_ENC_BUFF
 static NVENCSTATUS NVENCAPI vnf_DestroyEncoder(void *e)
 {
     NVENCSTATUS st = g_real.nvEncDestroyEncoder(e);
-    vnf_log(1, "DestroyEncoder -> %s", vnf_status(st));
+    char who[160];
+    vnf_caller(who, sizeof(who), _ReturnAddress());
+    vnf_log(1, "DestroyEncoder -> %s   (called from %s)", vnf_status(st), who);
     return st;
 }
 

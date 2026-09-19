@@ -25,14 +25,20 @@
 #include "nvEncodeAPI.h"
 #include "../src/nvenc_deprecated_presets.h"
 
-#define WIDTH   640
-#define HEIGHT  360
-#define FRAMES  10
-
 typedef NVENCSTATUS(NVENCAPI *PFN_CREATE_INSTANCE)(NV_ENCODE_API_FUNCTION_LIST *);
 
 static int g_failures = 0;
 static int g_as71     = 0;   // impersonate an SDK 7.1 client
+
+// Settable so a host's exact render template can be reproduced.
+static int WIDTH   = 640;
+static int HEIGHT  = 360;
+static int FRAMES  = 10;
+static int g_fpsNum  = 30;
+static int g_fpsDen  = 1;
+static int g_bitrate = 0;    // bits/sec; 0 = leave the preset's own value
+static int g_cbr     = 0;    // force CBR rate control
+static int g_high    = 0;    // force High profile
 
 // SDK 7.1 version stamps. Struct indices come from the SDK 8.0 header (the
 // oldest published); the function-list index is confirmed correct because
@@ -68,7 +74,19 @@ int main(int argc, char **argv)
     char dllPath[MAX_PATH];
     dllPath[0] = '\0';
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--as71") == 0) g_as71 = 1;
+        if      (strcmp(argv[i], "--as71") == 0) g_as71 = 1;
+        else if (strcmp(argv[i], "--cbr")  == 0) g_cbr  = 1;
+        else if (strcmp(argv[i], "--high") == 0) g_high = 1;
+        else if (strncmp(argv[i], "--width=",   8) == 0) WIDTH     = atoi(argv[i] + 8);
+        else if (strncmp(argv[i], "--height=",  9) == 0) HEIGHT    = atoi(argv[i] + 9);
+        else if (strncmp(argv[i], "--frames=", 9) == 0) FRAMES    = atoi(argv[i] + 9);
+        else if (strncmp(argv[i], "--fps=",     6) == 0) {
+            double f = atof(argv[i] + 6);
+            // 59.94 is 60000/1001; keep it exact rather than rounding.
+            if (f > 0 && f - (int)f > 0.001) { g_fpsNum = (int)(f * 1001.0 + 0.5); g_fpsDen = 1001; }
+            else { g_fpsNum = (int)f; g_fpsDen = 1; }
+        }
+        else if (strncmp(argv[i], "--bitrate=", 10) == 0) g_bitrate = atoi(argv[i] + 10);
         else snprintf(dllPath, sizeof(dllPath), "%s", argv[i]);
     }
     if (!dllPath[0]) {
@@ -79,8 +97,12 @@ int main(int argc, char **argv)
 
     printf("=== nvenc_verify ===\n");
     printf("DLL under test: %s\n", dllPath);
-    printf("client profile: %s\n\n",
+    printf("client profile: %s\n",
            g_as71 ? "SDK 7.1 (impersonating VEGAS mxavcaacplug)" : "current SDK");
+    printf("stream        : %dx%d @ %d/%d fps", WIDTH, HEIGHT, g_fpsNum, g_fpsDen);
+    if (g_bitrate) printf(", %s %d bps", g_cbr ? "CBR" : "VBR", g_bitrate);
+    if (g_high)    printf(", High profile");
+    printf("\n\n");
 
     HMODULE lib = LoadLibraryA(dllPath);
     if (!lib) { printf("FATAL: LoadLibrary failed (err %lu)\n", GetLastError()); return 2; }
@@ -158,6 +180,18 @@ int main(int argc, char **argv)
     pc.presetCfg.frameIntervalP              = 1;
     pc.presetCfg.rcParams.enableLookahead    = 0;
 
+    if (g_bitrate) {
+        pc.presetCfg.rcParams.rateControlMode = g_cbr ? NV_ENC_PARAMS_RC_CBR
+                                                      : NV_ENC_PARAMS_RC_VBR;
+        pc.presetCfg.rcParams.averageBitRate  = (uint32_t)g_bitrate;
+        pc.presetCfg.rcParams.maxBitRate      = (uint32_t)g_bitrate;
+        pc.presetCfg.rcParams.vbvBufferSize   =
+            (uint32_t)((double)g_bitrate * g_fpsDen / g_fpsNum);
+        pc.presetCfg.rcParams.vbvInitialDelay = pc.presetCfg.rcParams.vbvBufferSize;
+    }
+    if (g_high)
+        pc.presetCfg.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
+
     NV_ENC_INITIALIZE_PARAMS init;
     memset(&init, 0, sizeof(init));
     init.version       = VER(NV_ENC_INITIALIZE_PARAMS_VER, V71_INIT);
@@ -167,8 +201,8 @@ int main(int argc, char **argv)
     init.encodeHeight  = HEIGHT;
     init.darWidth      = WIDTH;
     init.darHeight     = HEIGHT;
-    init.frameRateNum  = 30;
-    init.frameRateDen  = 1;
+    init.frameRateNum  = g_fpsNum;
+    init.frameRateDen  = g_fpsDen;
     init.enablePTD     = 1;
     init.encodeConfig  = &pc.presetCfg;
     init.tuningInfo    = NV_ENC_TUNING_INFO_UNDEFINED;
