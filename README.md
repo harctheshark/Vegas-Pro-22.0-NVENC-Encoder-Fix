@@ -17,6 +17,42 @@ acceleration in VEGAS Pro fails immediately:
 > An error occurred while creating the media file Untitled.mp4.
 > Error 0x80660008 (message missing)
 
+### Decoding the error number
+
+`0x80660008` is not an opaque VEGAS code. `mxavcaacplug.dll` builds it by ORing
+the raw NVENC status into a fixed mask — the instruction appears at eleven sites
+in that DLL, each immediately after a failed call:
+
+```asm
+000000018004AE95:  call r8                  ; nvEncOpenEncodeSessionEx
+000000018004AE98:  test eax,eax
+000000018004AE9A:  je   ...success
+000000018004AE9C:  or   eax,80660000h       ; 0x80660000 | NVENCSTATUS
+```
+
+So **`0x8066NNNN` means NVENCSTATUS `NNNN`**, and the low half is readable
+straight off the `NVENCSTATUS` enum:
+
+| Error shown | NVENC status | Meaning |
+|---|---|---|
+| `0x80660001` | 1 | `NV_ENC_ERR_NO_ENCODE_DEVICE` |
+| `0x80660002` | 2 | `NV_ENC_ERR_UNSUPPORTED_DEVICE` |
+| `0x80660008` | **8** | **`NV_ENC_ERR_INVALID_PARAM`** |
+| `0x8066000C` | 12 | `NV_ENC_ERR_UNSUPPORTED_PARAM` |
+| `0x8066000F` | 15 | `NV_ENC_ERR_INVALID_VERSION` |
+
+`0x80660008` therefore means *invalid parameter*, and it is raised by the
+plugin's own pre-flight validation in `NvHWEncoder.cpp` — often **before** any
+NVENC call is made, which is why an NVENC-level trace can come back clean while
+the render still fails. That validation returns `NV_ENC_ERR_INVALID_PARAM` when
+the frame is larger than the configured maximum, when width or height is zero,
+or when a 10-bit pixel format is paired with H.264 (its only logged case:
+`"10 bit is not supported with H264"`, line 755).
+
+Those diagnostics go to **stderr**, which a GUI process discards. Capture them
+with `scripts\run-vegas-traced.ps1`, which starts VEGAS with an inherited stderr
+handle.
+
 ### Root cause
 
 NVIDIA Video Codec SDK 13.x **removed the legacy encode presets** —
