@@ -4,7 +4,8 @@ A compatibility shim that fixes **VEGAS Pro render error `0x80660008 (message mi
 on recent NVIDIA drivers, by restoring the NVENC preset API that NVIDIA removed.
 
 No VEGAS file is patched. No NVIDIA file is patched or redistributed. The fix is a
-single proxy DLL that sits next to `vegas220.exe` and translates one API call.
+single proxy DLL that sits next to `vegas220.exe`, forwards everything to the real
+driver, and repairs the two calls that a decade-old NVENC client can no longer make.
 
 ---
 
@@ -152,8 +153,12 @@ Then, from an **elevated** PowerShell (writing to `C:\Program Files` needs admin
 with VEGAS closed:
 
 ```powershell
-.\scripts\install.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
+
+The `-ExecutionPolicy Bypass` applies to that one invocation only and changes no
+machine setting; Windows blocks unsigned `.ps1` files by default. If your policy
+already allows local scripts, `.\scripts\install.ps1` works directly.
 
 The installer auto-detects the VEGAS folder, refuses to run while VEGAS is open,
 backs up anything already at the destination, verifies the copy by SHA-256, and
