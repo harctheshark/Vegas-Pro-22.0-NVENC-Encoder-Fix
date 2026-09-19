@@ -39,6 +39,7 @@ static int g_fpsDen  = 1;
 static int g_bitrate = 0;    // bits/sec; 0 = leave the preset's own value
 static int g_cbr     = 0;    // force CBR rate control
 static int g_high    = 0;    // force High profile
+static int g_zeropreset = 0; // simulate a template with no preset GUID (all zeros)
 
 // SDK 7.1 version stamps. Struct indices come from the SDK 8.0 header (the
 // oldest published); the function-list index is confirmed correct because
@@ -77,6 +78,7 @@ int main(int argc, char **argv)
         if      (strcmp(argv[i], "--as71") == 0) g_as71 = 1;
         else if (strcmp(argv[i], "--cbr")  == 0) g_cbr  = 1;
         else if (strcmp(argv[i], "--high") == 0) g_high = 1;
+        else if (strcmp(argv[i], "--zeropreset") == 0) g_zeropreset = 1;
         else if (strncmp(argv[i], "--width=",   8) == 0) WIDTH     = atoi(argv[i] + 8);
         else if (strncmp(argv[i], "--height=",  9) == 0) HEIGHT    = atoi(argv[i] + 9);
         else if (strncmp(argv[i], "--frames=", 9) == 0) FRAMES    = atoi(argv[i] + 9);
@@ -143,12 +145,14 @@ int main(int argc, char **argv)
 
     // --- 1. the call that VEGAS fails on --------------------------------
     printf("[1] legacy preset config (the call VEGAS makes)\n");
+    GUID testPreset = VNF_NV_ENC_PRESET_HQ_GUID;
+    if (g_zeropreset) memset(&testPreset, 0, sizeof(testPreset));
     NV_ENC_PRESET_CONFIG pc;
     memset(&pc, 0, sizeof(pc));
     pc.version           = VER(NV_ENC_PRESET_CONFIG_VER, V71_PRESET_CFG);
     pc.presetCfg.version = VER(NV_ENC_CONFIG_VER, V71_CONFIG);
     st = api.nvEncGetEncodePresetConfig(enc, NV_ENC_CODEC_H264_GUID,
-                                        VNF_NV_ENC_PRESET_HQ_GUID, &pc);
+                                        testPreset, &pc);
     check("nvEncGetEncodePresetConfig(H.264, NV_ENC_PRESET_HQ_GUID)", st);
     if (st != NV_ENC_SUCCESS) {
         printf("\n  Legacy presets are unavailable through this DLL.\n");
@@ -196,7 +200,7 @@ int main(int argc, char **argv)
     memset(&init, 0, sizeof(init));
     init.version       = VER(NV_ENC_INITIALIZE_PARAMS_VER, V71_INIT);
     init.encodeGUID    = NV_ENC_CODEC_H264_GUID;
-    init.presetGUID    = VNF_NV_ENC_PRESET_HQ_GUID;   // legacy GUID on purpose
+    init.presetGUID    = testPreset;                 // legacy, or all-zero with --zeropreset
     init.encodeWidth   = WIDTH;
     init.encodeHeight  = HEIGHT;
     init.darWidth      = WIDTH;

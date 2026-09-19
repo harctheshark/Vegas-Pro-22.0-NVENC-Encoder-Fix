@@ -69,7 +69,7 @@
 #include "nvenc_deprecated_presets.h"
 #include "nvenc_preset_map.h"
 
-#define VNF_VERSION "1.5.0"
+#define VNF_VERSION "1.6.0"
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
@@ -176,6 +176,33 @@ static const char *vnf_codec_name(const GUID *g)
     if (IsEqualGUID(g, &NV_ENC_CODEC_HEVC_GUID)) return "HEVC";
     if (IsEqualGUID(g, &NV_ENC_CODEC_AV1_GUID))  return "AV1";
     return "other-codec-GUID";
+}
+
+// Names a preset GUID for the log. An all-zero GUID is called out explicitly:
+// that is what a render template holds when its preset list could not be
+// populated, and it behaves very differently from a merely obsolete GUID.
+static const char *vnf_preset_name(const GUID *g)
+{
+    static const GUID kZero = { 0 };
+    if (IsEqualGUID(g, &kZero)) return "ALL-ZERO (template had no preset)";
+    for (int i = 0; i < VNF_MAP_COUNT; i++)
+        if (IsEqualGUID(g, VNF_MAP_H264[i].legacy)) return VNF_MAP_H264[i].name;
+    if (IsEqualGUID(g, &NV_ENC_PRESET_P1_GUID)) return "P1";
+    if (IsEqualGUID(g, &NV_ENC_PRESET_P2_GUID)) return "P2";
+    if (IsEqualGUID(g, &NV_ENC_PRESET_P3_GUID)) return "P3";
+    if (IsEqualGUID(g, &NV_ENC_PRESET_P4_GUID)) return "P4";
+    if (IsEqualGUID(g, &NV_ENC_PRESET_P5_GUID)) return "P5";
+    if (IsEqualGUID(g, &NV_ENC_PRESET_P6_GUID)) return "P6";
+    if (IsEqualGUID(g, &NV_ENC_PRESET_P7_GUID)) return "P7";
+    return "unrecognised";
+}
+
+static int vnf_is_modern_preset(const GUID *g)
+{
+    return IsEqualGUID(g, &NV_ENC_PRESET_P1_GUID) || IsEqualGUID(g, &NV_ENC_PRESET_P2_GUID) ||
+           IsEqualGUID(g, &NV_ENC_PRESET_P3_GUID) || IsEqualGUID(g, &NV_ENC_PRESET_P4_GUID) ||
+           IsEqualGUID(g, &NV_ENC_PRESET_P5_GUID) || IsEqualGUID(g, &NV_ENC_PRESET_P6_GUID) ||
+           IsEqualGUID(g, &NV_ENC_PRESET_P7_GUID);
 }
 
 // Logs the first time a given call site is reached, and thereafter only on
@@ -370,6 +397,18 @@ static NVENCSTATUS NVENCAPI vnf_GetEncodeCaps(void *e, GUID codec, NV_ENC_CAPS_P
     return st;
 }
 
+// The host calls this with the preset GUID stored in its render template and
+// then IGNORES a failure: at mxavcaacplug.dll+0x327F8 the check is
+// "test r14d,r14d / js", which only branches on a NEGATIVE value, while every
+// NVENCSTATUS failure is a small POSITIVE one. So a failure here is swallowed,
+// the 0xE00-byte copy of the returned config at +0x327DE is skipped, and the
+// encoder is initialised from a zeroed NV_ENC_CONFIG - which surfaces later as
+// NV_ENC_ERR_INVALID_PARAM (8) and is reported as 0x80660008.
+//
+// This function therefore must not fail. If the requested preset cannot be
+// resolved - a removed legacy GUID, a stale or empty GUID out of a template
+// whose preset list could not be populated, anything unrecognised - fall back
+// to a sane modern preset so the host receives a fully populated config.
 static NVENCSTATUS NVENCAPI vnf_GetEncodePresetConfig(void *encoder, GUID encodeGUID,
                                                       GUID presetGUID,
                                                       NV_ENC_PRESET_CONFIG *presetConfig)
@@ -378,25 +417,34 @@ static NVENCSTATUS NVENCAPI vnf_GetEncodePresetConfig(void *encoder, GUID encode
     vnf_ver_set(&vo, presetConfig, NV_ENC_PRESET_CONFIG_VER);
     vnf_ver_set(&vi, presetConfig ? &presetConfig->presetCfg : NULL, NV_ENC_CONFIG_VER);
 
+    char who[160];
+    vnf_caller(who, sizeof(who), _ReturnAddress());
+
     // Give the driver first refusal: where the legacy presets still work this
     // succeeds and nothing is translated.
     NVENCSTATUS st = g_real.nvEncGetEncodePresetConfig(encoder, encodeGUID, presetGUID, presetConfig);
+    const char *how = "driver";
 
-    if (st != NV_ENC_SUCCESS) {
+    if (st != NV_ENC_SUCCESS && g_real.nvEncGetEncodePresetConfigEx) {
         const vnf_preset_row *row = vnf_find_row(&encodeGUID, &presetGUID);
-        if (row && g_real.nvEncGetEncodePresetConfigEx) {
-            NVENCSTATUS st2 = g_real.nvEncGetEncodePresetConfigEx(encoder, encodeGUID,
-                                                                  *row->modern, row->tuning,
-                                                                  presetConfig);
-            vnf_log(1, "preset %s (%s) -> P%d tuning=%d : %s",
-                    row->name,
-                    IsEqualGUID(&encodeGUID, &NV_ENC_CODEC_HEVC_GUID) ? "HEVC" : "H.264",
-                    row->pnum, (int)row->tuning, vnf_status(st2));
-            st = st2;
+        GUID               useGuid;
+        NV_ENC_TUNING_INFO useTune;
+        if (row) {
+            useGuid = *row->modern;
+            useTune = row->tuning;
+            how     = row->name;
         } else {
-            vnf_log(1, "GetEncodePresetConfig -> %s (no mapping for that preset)", vnf_status(st));
+            // Unrecognised preset. P4 + high quality is the middle of the
+            // modern range and what NVIDIA's guide maps H.264 "HQ" onto.
+            useGuid = NV_ENC_PRESET_P4_GUID;
+            useTune = NV_ENC_TUNING_INFO_HIGH_QUALITY;
+            how     = "UNKNOWN->P4 fallback";
         }
+        st = g_real.nvEncGetEncodePresetConfigEx(encoder, encodeGUID, useGuid, useTune, presetConfig);
     }
+
+    vnf_log(1, "GetEncodePresetConfig(%s, preset=%s) via %s -> %s  [from %s]",
+            vnf_codec_name(&encodeGUID), vnf_preset_name(&presetGUID), how, vnf_status(st), who);
 
     vnf_ver_restore(&vi);
     vnf_ver_restore(&vo);
@@ -408,6 +456,7 @@ static NVENCSTATUS NVENCAPI vnf_GetEncodePresetConfigEx(void *encoder, GUID enco
                                                         NV_ENC_TUNING_INFO tuningInfo,
                                                         NV_ENC_PRESET_CONFIG *presetConfig)
 {
+    const GUID asked = presetGUID;
     const vnf_preset_row *row = vnf_find_row(&encodeGUID, &presetGUID);
     if (row) {
         if (tuningInfo == NV_ENC_TUNING_INFO_UNDEFINED) tuningInfo = row->tuning;
@@ -418,9 +467,20 @@ static NVENCSTATUS NVENCAPI vnf_GetEncodePresetConfigEx(void *encoder, GUID enco
     vnf_ver_set(&vi, presetConfig ? &presetConfig->presetCfg : NULL, NV_ENC_CONFIG_VER);
     NVENCSTATUS st = g_real.nvEncGetEncodePresetConfigEx(encoder, encodeGUID, presetGUID,
                                                          tuningInfo, presetConfig);
+
+    // Same reasoning as the non-Ex form: a caller that ignores the status must
+    // not be handed an unfilled config.
+    if (st != NV_ENC_SUCCESS) {
+        st = g_real.nvEncGetEncodePresetConfigEx(encoder, encodeGUID, NV_ENC_PRESET_P4_GUID,
+                                                 NV_ENC_TUNING_INFO_HIGH_QUALITY, presetConfig);
+        vnf_log(1, "GetEncodePresetConfigEx(%s, preset=%s) -> fell back to P4/HQ : %s",
+                vnf_codec_name(&encodeGUID), vnf_preset_name(&asked), vnf_status(st));
+    } else {
+        vnf_log(1, "GetEncodePresetConfigEx(%s, preset=%s, tuning=%d) -> %s",
+                vnf_codec_name(&encodeGUID), vnf_preset_name(&asked), (int)tuningInfo, vnf_status(st));
+    }
     vnf_ver_restore(&vi);
     vnf_ver_restore(&vo);
-    VNF_TRACE(st, "GetEncodePresetConfigEx -> %s", vnf_status(st));
     return st;
 }
 
@@ -487,11 +547,20 @@ static NVENCSTATUS NVENCAPI vnf_GetEncodePresetGUIDs(void *encoder, GUID encodeG
 static NVENCSTATUS NVENCAPI vnf_InitializeEncoder(void *encoder, NV_ENC_INITIALIZE_PARAMS *p)
 {
     const vnf_preset_row *row = NULL;
+    const char *presetWas = "(none)";
     if (p) {
+        presetWas = vnf_preset_name(&p->presetGUID);
         row = vnf_find_row(&p->encodeGUID, &p->presetGUID);
         if (row) {
             p->presetGUID = *row->modern;
             if (p->tuningInfo == NV_ENC_TUNING_INFO_UNDEFINED) p->tuningInfo = row->tuning;
+        } else if (g_uplift && !vnf_is_modern_preset(&p->presetGUID)) {
+            // Neither a legacy preset nor a P1..P7 one - typically all zeros,
+            // left behind by a template whose preset list could not be built.
+            // The driver rejects that outright, so substitute a valid preset
+            // rather than let initialisation fail.
+            p->presetGUID  = NV_ENC_PRESET_P4_GUID;
+            p->tuningInfo  = NV_ENC_TUNING_INFO_HIGH_QUALITY;
         } else if (g_uplift && p->tuningInfo == NV_ENC_TUNING_INFO_UNDEFINED) {
             // A pre-SDK-10 client never set tuningInfo, and zero is not a valid
             // value for encoding. High quality is what the old presets targeted.
@@ -506,9 +575,10 @@ static NVENCSTATUS NVENCAPI vnf_InitializeEncoder(void *encoder, NV_ENC_INITIALI
     vnf_ver_restore(&vc);
     vnf_ver_restore(&vo);
 
-    vnf_log(1, "InitializeEncoder: %ux%u preset=%s tuning=%d : %s",
-            p ? p->encodeWidth : 0, p ? p->encodeHeight : 0,
-            row ? row->name : "(modern)", p ? (int)p->tuningInfo : -1, vnf_status(st));
+    vnf_log(1, "InitializeEncoder: %ux%u preset %s -> %s tuning=%d : %s",
+            p ? p->encodeWidth : 0, p ? p->encodeHeight : 0, presetWas,
+            p ? vnf_preset_name(&p->presetGUID) : "(none)",
+            p ? (int)p->tuningInfo : -1, vnf_status(st));
     return st;
 }
 
