@@ -20,7 +20,7 @@ Symptoms this fixes:
 
 ## Quick start
 
-1. Download the latest release and unzip it anywhere.
+1. Download the latest release and unzip it anywhere. ([full guide](INSTALL.md))
 2. **Close VEGAS.**
 3. Double-click **`install.cmd`**.
 
