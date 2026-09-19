@@ -98,17 +98,26 @@ straight off the `NVENCSTATUS` enum:
 | `0x8066000C` | 12 | `NV_ENC_ERR_UNSUPPORTED_PARAM` |
 | `0x8066000F` | 15 | `NV_ENC_ERR_INVALID_VERSION` |
 
-`0x80660008` therefore means *invalid parameter*, and it is raised by the
-plugin's own pre-flight validation in `NvHWEncoder.cpp` — often **before** any
-NVENC call is made, which is why an NVENC-level trace can come back clean while
-the render still fails. That validation returns `NV_ENC_ERR_INVALID_PARAM` when
-the frame is larger than the configured maximum, when width or height is zero,
-or when a 10-bit pixel format is paired with H.264 (its only logged case:
-`"10 bit is not supported with H264"`, line 755).
+`0x80660008` therefore means *invalid parameter*. It is raised by
+`sub_18004AF80`, which asks the driver to enumerate the available presets and
+linearly scans the returned array for the GUID stored in your render template:
 
-Those diagnostics go to **stderr**, which a GUI process discards. Capture them
-with `scripts\run-vegas-traced.ps1`, which starts VEGAS with an inherited stderr
-handle.
+```asm
+000000018004B0C4:  ...                       ; scan the enumerated GUID array
+000000018004B0DE:  mov  r14d,1               ; found
+000000018004B10D:  test r14d,r14d
+000000018004B110:  je   000000018004B16F     ; not found ...
+000000018004B16F:  mov  ebp,8                ; ... NV_ENC_ERR_INVALID_PARAM
+000000018004B174:  or   ebp,80660000h
+```
+
+The legacy GUIDs are gone from the driver's list, so the scan cannot match. The
+**same lookup populates the Preset dropdown**, which is why an empty dropdown and
+a failed render are one fault rather than two.
+
+The plugin's own diagnostics go to **stderr**, which a GUI process discards;
+`scripts\run-vegas-traced.ps1` starts VEGAS with an inherited stderr handle if
+you need them.
 
 ### Root cause
 
@@ -201,6 +210,17 @@ DLL, loaded by absolute System32 path, and repairs two things:
    through `nvEncGetEncodePresetConfigEx`. The legacy GUIDs are also
    re-advertised by `nvEncGetEncodePresetCount` / `...GUIDs`, and rewritten in
    `nvEncInitializeEncoder`.
+
+3. **Staying loaded.** `mxavcaacplug.dll` caches the module handle it gets from
+   `LoadLibraryW` and calls `FreeLibrary` on it in its state object's
+   destructor. VEGAS runs a capability probe before rendering — construct,
+   init, close, destruct — which drops this DLL's reference count to zero and
+   unmaps it. The render then calls `LoadLibraryW("nvEncodeAPI64.dll")` again
+   and, because the shim had already loaded the real driver by absolute path
+   and never released it, the loader satisfies the bare name from that
+   already-mapped System32 copy. Without a pin the render runs entirely
+   unhooked, and repairs 1 and 2 never execute. The shim pins itself with
+   `GET_MODULE_HANDLE_EX_FLAG_PIN`.
 
 Everything else passes through untouched, including all eight undocumented
 `NvTool*` exports, forwarded in assembly so that any signature survives intact.
@@ -350,22 +370,19 @@ InitializeEncoder: preset HQ -> P4 tuning=1 (1920x1080, params ver 0xF107000D)
 
 ## Troubleshooting
 
-**`0x80660008` specifically — invalid parameter, raised before NVENC is called.**
-The shim log shows `OpenEncodeSessionEx` succeeding, `DestroyEncoder` right
-after, and no preset or init call in between. The encoder opened fine and the
-plugin then rejected the configuration itself. Two settings cause this:
+**The log shows `OpenEncodeSessionEx` then `DestroyEncoder` and nothing else,
+and the render still fails.** That exact three-line trace is VEGAS's capability
+probe, not the render. If it is *all* you see, the shim was unloaded before the
+render happened — the failure this project spent the longest chasing. The shim
+pins itself specifically to prevent it, and a working log says so on the second
+line:
 
-1. **A 10-bit pixel format with H.264.** The plugin refuses that combination
-   outright (`NvHWEncoder.cpp` line 755). Check **File → Properties → Video →
-   Pixel format** and set it to **8-bit**; "32-bit floating point" makes VEGAS
-   work in high bit depth and can push a 10-bit format at the encoder. Switching
-   the render to HEVC also sidesteps this check, since HEVC does support 10-bit.
-2. **A frame larger than the encoder's configured maximum.** In the render
-   template's Custom Settings, make the frame size match the project exactly and
-   untick *Allow source to adjust frame size*.
+```
+pinned: this module will stay mapped for the process lifetime
+```
 
-To find out which, capture the plugin's own message with
-`scripts\run-vegas-traced.ps1` and look for a `NvHWEncoder.cpp` line.
+If that line is missing, or present and the trace still stops after the probe,
+please open an issue and attach the log.
 
 **The Preset list is empty and NVENC renders fail, but the shim log shows a
 successful `OpenEncodeSessionEx` followed by `DestroyEncoder` and nothing else.**
