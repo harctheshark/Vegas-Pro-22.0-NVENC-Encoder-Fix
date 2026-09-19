@@ -198,7 +198,17 @@ InitializeEncoder: preset HQ -> P4 tuning=1 (1920x1080, params ver 0xF107000D)
 
 **Still failing, and the log file does not exist.** The shim was never loaded.
 Confirm `nvEncodeAPI64.dll` sits in the same folder as `vegas220.exe`, not in a
-plug-in subfolder — the loader searches the *executable's* directory.
+plug-in subfolder — the loader searches the *executable's* directory. Copy
+`nvenc_whichdll.exe` into the VEGAS folder and run it to see which file the
+loader actually picks:
+
+```
+this executable : C:\Program Files\VEGAS\VEGAS Pro 22.0\nvenc_whichdll.exe
+resolved to     : C:\Program Files\VEGAS\VEGAS Pro 22.0\nvEncodeAPI64.dll
+=> local copy wins. A shim placed here WILL be used.
+```
+
+If it reports the System32 copy instead, the shim is in the wrong folder.
 
 **Log exists but shows no `translated preset` line.** The render never reached
 NVENC. Check that the render template actually has hardware encoding enabled.
@@ -241,6 +251,7 @@ src/nvenc_thunks.asm             register-exact NvTool* forwarders
 src/nvenc_shim.def               export surface, ordinals pinned to the driver's
 tools/nvenc_probe.c              driver capability probe
 tools/nvenc_verify.c             end-to-end pass/fail test
+tools/nvenc_whichdll.c           shows which nvEncodeAPI64.dll the loader picks
 scripts/build.cmd                MSVC build
 scripts/install.ps1              install, with backup + manifest
 scripts/uninstall.ps1            uninstall, with restore
