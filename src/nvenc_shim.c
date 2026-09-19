@@ -69,7 +69,7 @@
 #include "nvenc_deprecated_presets.h"
 #include "nvenc_preset_map.h"
 
-#define VNF_VERSION "1.7.0"
+#define VNF_VERSION "1.7.1"
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
@@ -753,97 +753,79 @@ static NVENCSTATUS NVENCAPI vnf_GetSequenceParamEx(void *e, NV_ENC_INITIALIZE_PA
 typedef struct {
     uint32_t    rva;
     const char *what;
-    int         reg;        // 0=eax 1=ebp 2=ecx 3=edi
+    int         immOff;     // offset of the imm32 within the instruction
     BYTE        expect0;    // first opcode byte, verified before patching
     BYTE        saved;
     BYTE       *addr;
     LONG        fired;
 } vnf_trap;
 
+// immOff: 1 for "0D imm32" (or eax), 2 for "81 /1 imm32" (or ebp/ecx/edi).
+// Site index N is written into bits 8..15 of the constant, so the HRESULT the
+// host reports becomes 0x8066NNss - NN identifying the site, ss the status.
 static vnf_trap g_traps[] = {
-    { 0x4ADE3, "load nvEncodeAPI64/GetProcAddress failed (const 0x0A)", 0, 0x0D, 0, NULL, 0 },
-    { 0x4AE9C, "CreateInstance or OpenEncodeSessionEx failed",          0, 0x0D, 0, NULL, 0 },
-    { 0x4AF00, "DestroyEncoder failed (close path)",                    0, 0x0D, 0, NULL, 0 },
-    { 0x4B144, "encoder-config validation sub_180050E80 failed",        0, 0x0D, 0, NULL, 0 },
-    { 0x4B174, "PRESET LOOKUP sub_18004AF80: preset GUID not enumerated", 1, 0x81, 0, NULL, 0 },
-    { 0x4B1C9, "DestroyEncoder failed (second close path)",             2, 0x81, 0, NULL, 0 },
-    { 0x4B413, "sub_180050860 failed",                                  0, 0x0D, 0, NULL, 0 },
-    { 0x4B444, "logged failure path A",                                 3, 0x81, 0, NULL, 0 },
-    { 0x4B475, "logged failure path B",                                 3, 0x81, 0, NULL, 0 },
-    { 0x4B929, "EncodePicture failed",                                  0, 0x0D, 0, NULL, 0 },
-    { 0x4BA68, "EncodePicture(EOS flush) failed",                       0, 0x0D, 0, NULL, 0 },
+    { 0x4ADE3, "load nvEncodeAPI64 / GetProcAddress failed",              1, 0x0D, 0, NULL, 0 },
+    { 0x4AE9C, "CreateInstance or OpenEncodeSessionEx failed",            1, 0x0D, 0, NULL, 0 },
+    { 0x4AF00, "DestroyEncoder failed (close path)",                      1, 0x0D, 0, NULL, 0 },
+    { 0x4B144, "encoder-config validation sub_180050E80 failed",          1, 0x0D, 0, NULL, 0 },
+    { 0x4B174, "PRESET LOOKUP sub_18004AF80: preset GUID not enumerated", 2, 0x81, 0, NULL, 0 },
+    { 0x4B1C9, "DestroyEncoder failed (second close path)",               2, 0x81, 0, NULL, 0 },
+    { 0x4B413, "sub_180050860 failed",                                    1, 0x0D, 0, NULL, 0 },
+    { 0x4B444, "logged failure path A",                                   2, 0x81, 0, NULL, 0 },
+    { 0x4B475, "logged failure path B",                                   2, 0x81, 0, NULL, 0 },
+    { 0x4B929, "EncodePicture failed",                                    1, 0x0D, 0, NULL, 0 },
+    { 0x4BA68, "EncodePicture (EOS flush) failed",                        1, 0x0D, 0, NULL, 0 },
 };
 #define VNF_TRAP_COUNT ((int)(sizeof(g_traps) / sizeof(g_traps[0])))
 
-static PVOID g_veh;
-
-static LONG CALLBACK vnf_veh(EXCEPTION_POINTERS *ep)
-{
-    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT)
-        return EXCEPTION_CONTINUE_SEARCH;
-
-    BYTE *hit = (BYTE *)(ep->ContextRecord->Rip - 1);
-    for (int i = 0; i < VNF_TRAP_COUNT; i++) {
-        if (g_traps[i].addr != hit) continue;
-
-        DWORD64 v = 0;
-        switch (g_traps[i].reg) {
-            case 0: v = ep->ContextRecord->Rax; break;
-            case 1: v = ep->ContextRecord->Rbp; break;
-            case 2: v = ep->ContextRecord->Rcx; break;
-            default: v = ep->ContextRecord->Rdi; break;
-        }
-        const unsigned status = (unsigned)(v & 0xFFFFFFFF);
-
-        DWORD old;
-        if (VirtualProtect(g_traps[i].addr, 1, PAGE_EXECUTE_READWRITE, &old)) {
-            *g_traps[i].addr = g_traps[i].saved;
-            VirtualProtect(g_traps[i].addr, 1, old, &old);
-            FlushInstructionCache(GetCurrentProcess(), g_traps[i].addr, 1);
-        }
-        ep->ContextRecord->Rip -= 1;     // re-run the original instruction
-
-        vnf_log(1, "*** ERROR SITE HIT: mxavcaacplug.dll+0x%X -> HRESULT 0x8066%04X",
-                g_traps[i].rva, status & 0xFFFF);
-        vnf_log(1, "    NVENCSTATUS %u = %s", status, vnf_status((NVENCSTATUS)status));
-        vnf_log(1, "    meaning: %s", g_traps[i].what);
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-
+// An earlier version put a one-shot INT3 at each site and caught it with a
+// vectored handler. That crashed VEGAS: the host installs its own crash
+// reporting, and an unexpected breakpoint in a GUI application is not
+// survivable in practice. Never hand an exception to a host that did not ask
+// for one.
+//
+// This does the same job without any exception at all. Each site already ORs a
+// constant; only the constant is edited, so the site index travels out through
+// the host's own error reporting. One byte per site, no control-flow change,
+// no new code executed.
 static void vnf_arm_traps(void)
 {
     WCHAR buf[8];
     if (GetEnvironmentVariableW(L"VEGAS_NVENC_FIX_TRAP", buf, 8) > 0 && buf[0] == L'0') {
-        vnf_log(1, "VEGAS_NVENC_FIX_TRAP=0 -> error-site trap disabled");
+        vnf_log(1, "VEGAS_NVENC_FIX_TRAP=0 -> error-site tagging disabled");
         return;
     }
 
     HMODULE m = GetModuleHandleA("mxavcaacplug.dll");
-    if (!m) { vnf_log(1, "trap: mxavcaacplug.dll not loaded yet - not armed"); return; }
+    if (!m) { vnf_log(1, "tag: mxavcaacplug.dll not loaded - nothing tagged"); return; }
 
-    g_veh = AddVectoredExceptionHandler(1, vnf_veh);
-    if (!g_veh) { vnf_log(1, "trap: AddVectoredExceptionHandler failed"); return; }
-
-    int armed = 0, skipped = 0;
+    int tagged = 0, skipped = 0;
     for (int i = 0; i < VNF_TRAP_COUNT; i++) {
         BYTE *p = (BYTE *)m + g_traps[i].rva;
-        if (*p != g_traps[i].expect0) {      // different build - leave it alone
+        // Verify the whole constant, not just the opcode, so a different build
+        // of the plugin is never written to.
+        BYTE *imm = p + g_traps[i].immOff;
+        if (*p != g_traps[i].expect0 ||
+            imm[0] != 0x00 || imm[1] != 0x00 || imm[2] != 0x66 || imm[3] != 0x80) {
             skipped++;
             continue;
         }
         DWORD old;
-        if (!VirtualProtect(p, 1, PAGE_EXECUTE_READWRITE, &old)) { skipped++; continue; }
-        g_traps[i].saved = *p;
-        g_traps[i].addr  = p;
-        *p = 0xCC;
-        VirtualProtect(p, 1, old, &old);
-        FlushInstructionCache(GetCurrentProcess(), p, 1);
-        armed++;
+        if (!VirtualProtect(imm + 1, 1, PAGE_EXECUTE_READWRITE, &old)) { skipped++; continue; }
+        g_traps[i].saved = imm[1];
+        g_traps[i].addr  = imm + 1;
+        imm[1] = (BYTE)(i + 1);            // 0x80660000 -> 0x8066NN00
+        VirtualProtect(imm + 1, 1, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), imm + 1, 1);
+        tagged++;
     }
-    vnf_log(1, "trap: armed %d of %d error sites in mxavcaacplug.dll (%d skipped)",
-            armed, VNF_TRAP_COUNT, skipped);
+
+    vnf_log(1, "tag: marked %d of %d error sites (%d skipped)",
+            tagged, VNF_TRAP_COUNT, skipped);
+    vnf_log(1, "     the reported error becomes 0x8066NNss - NN = site, ss = NVENCSTATUS:");
+    for (int i = 0; i < VNF_TRAP_COUNT; i++)
+        if (g_traps[i].addr)
+            vnf_log(1, "       NN=%02X  +0x%-6X %s", i + 1, g_traps[i].rva, g_traps[i].what);
 }
 
 // ----------------------------------------------------------------- exports --
