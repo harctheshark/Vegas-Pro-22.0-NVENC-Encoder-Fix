@@ -69,7 +69,7 @@
 #include "nvenc_deprecated_presets.h"
 #include "nvenc_preset_map.h"
 
-#define VNF_VERSION "1.8.0"
+#define VNF_VERSION "1.9.0"
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
@@ -262,6 +262,36 @@ static BOOL CALLBACK vnf_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
 
     InitializeCriticalSection(&g_log_lock);
     vnf_log_init();
+
+    // Pin this module for the life of the process. Without this the shim is
+    // gone by the time it matters, and everything below is dead code.
+    //
+    // mxavcaacplug.dll caches the module handle it gets from LoadLibraryW in
+    // its NVENC state object at +0x48, and that object's destructor
+    // (sub_180050AF0) calls FreeLibrary on it. VEGAS runs a capability probe
+    // before rendering - construct, init, close, destruct - which drops this
+    // DLL's reference count to zero and unmaps it. The render is a separate
+    // flow that allocates a fresh wrapper and calls LoadLibraryW again with
+    // the bare name "nvEncodeAPI64.dll"; by then the only module of that base
+    // name still mapped is the real driver, because vnf_init loaded it by
+    // absolute System32 path and never released it. The loader satisfies the
+    // bare name from that copy, and the entire render runs against an
+    // unhooked, un-uplifted 7.1 table.
+    //
+    // That is why the log only ever showed the probe's three calls, why no
+    // preset traffic appeared on runs that provably made those calls, and why
+    // in-memory patches to the plugin took effect while API-level repairs did
+    // not: the patches live in a module that stays loaded, the repairs did not.
+    {
+        HMODULE self = NULL;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN |
+                               GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                               (LPCWSTR)&__ImageBase, &self) && self)
+            vnf_log(1, "pinned: this module will stay mapped for the process lifetime");
+        else
+            vnf_log(1, "WARNING: could not pin this module (err %lu) - the host may "
+                       "unload it before the render", GetLastError());
+    }
 
     WCHAR buf[64];
     if (GetEnvironmentVariableW(L"VEGAS_NVENC_FIX_DISABLE", buf, 64) > 0 && buf[0] == L'1')
