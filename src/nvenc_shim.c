@@ -69,7 +69,7 @@
 #include "nvenc_deprecated_presets.h"
 #include "nvenc_preset_map.h"
 
-#define VNF_VERSION "1.4.0"
+#define VNF_VERSION "1.5.0"
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
@@ -168,6 +168,14 @@ static void vnf_caller(char *out, size_t cch, void *retaddr)
     _snprintf_s(out, cch, _TRUNCATE, "%s+0x%llX",
                 base ? base + 1 : path,
                 (unsigned long long)((uintptr_t)retaddr - (uintptr_t)mod));
+}
+
+static const char *vnf_codec_name(const GUID *g)
+{
+    if (IsEqualGUID(g, &NV_ENC_CODEC_H264_GUID)) return "H.264";
+    if (IsEqualGUID(g, &NV_ENC_CODEC_HEVC_GUID)) return "HEVC";
+    if (IsEqualGUID(g, &NV_ENC_CODEC_AV1_GUID))  return "AV1";
+    return "other-codec-GUID";
 }
 
 // Logs the first time a given call site is reached, and thereafter only on
@@ -416,17 +424,30 @@ static NVENCSTATUS NVENCAPI vnf_GetEncodePresetConfigEx(void *encoder, GUID enco
     return st;
 }
 
+// Preset enumeration is THE call that decides whether the host finds the preset
+// its saved template names. mxavcaacplug.dll looks its stored GUID up in the
+// array these two return and reports 0x80660008 when it is missing, so both are
+// logged unconditionally - including the pass-through cases. An earlier build
+// returned early for unrecognised codec GUIDs without logging, which hid the
+// very traffic being hunted; never return from here silently again.
 static NVENCSTATUS NVENCAPI vnf_GetEncodePresetCount(void *encoder, GUID encodeGUID,
                                                      uint32_t *encodePresetGUIDCount)
 {
     NVENCSTATUS st = g_real.nvEncGetEncodePresetCount(encoder, encodeGUID, encodePresetGUIDCount);
-    if (st != NV_ENC_SUCCESS || !g_augment_enum || !encodePresetGUIDCount) return st;
-    if (!IsEqualGUID(&encodeGUID, &NV_ENC_CODEC_H264_GUID) &&
-        !IsEqualGUID(&encodeGUID, &NV_ENC_CODEC_HEVC_GUID)) return st;
+    const uint32_t fromDriver = encodePresetGUIDCount ? *encodePresetGUIDCount : 0;
+    int augmented = 0;
 
-    *encodePresetGUIDCount += VNF_MAP_COUNT;
-    VNF_TRACE(st, "GetEncodePresetCount -> %u (driver + %d legacy)",
-              *encodePresetGUIDCount, VNF_MAP_COUNT);
+    if (st == NV_ENC_SUCCESS && g_augment_enum && encodePresetGUIDCount) {
+        *encodePresetGUIDCount += VNF_MAP_COUNT;
+        augmented = 1;
+    }
+
+    char who[160];
+    vnf_caller(who, sizeof(who), _ReturnAddress());
+    vnf_log(1, "GetEncodePresetCount(%s) -> %s, driver=%u total=%u%s  [from %s]",
+            vnf_codec_name(&encodeGUID), vnf_status(st), fromDriver,
+            encodePresetGUIDCount ? *encodePresetGUIDCount : 0,
+            augmented ? " (+legacy)" : "", who);
     return st;
 }
 
@@ -436,18 +457,30 @@ static NVENCSTATUS NVENCAPI vnf_GetEncodePresetGUIDs(void *encoder, GUID encodeG
 {
     NVENCSTATUS st = g_real.nvEncGetEncodePresetGUIDs(encoder, encodeGUID, presetGUIDs,
                                                       guidArraySize, encodePresetGUIDCount);
-    if (st != NV_ENC_SUCCESS || !g_augment_enum || !presetGUIDs || !encodePresetGUIDCount)
-        return st;
-    if (!IsEqualGUID(&encodeGUID, &NV_ENC_CODEC_H264_GUID) &&
-        !IsEqualGUID(&encodeGUID, &NV_ENC_CODEC_HEVC_GUID)) return st;
+    const uint32_t fromDriver = encodePresetGUIDCount ? *encodePresetGUIDCount : 0;
+    uint32_t n = fromDriver;
+    int appended = 0;
 
-    const vnf_preset_row *tbl = vnf_table_for_codec(&encodeGUID);
-    uint32_t n = *encodePresetGUIDCount;
-    for (int i = 0; i < VNF_MAP_COUNT && n < guidArraySize; i++)
-        presetGUIDs[n++] = *tbl[i].legacy;
+    if (st == NV_ENC_SUCCESS && g_augment_enum && presetGUIDs && encodePresetGUIDCount) {
+        // Append the legacy GUIDs for any codec. Restricting this to H.264 and
+        // HEVC meant a host asking with any other GUID got the bare driver list
+        // and failed its lookup.
+        const vnf_preset_row *tbl = vnf_table_for_codec(&encodeGUID);
+        for (int i = 0; i < VNF_MAP_COUNT && n < guidArraySize; i++) {
+            presetGUIDs[n++] = *tbl[i].legacy;
+            appended++;
+        }
+        *encodePresetGUIDCount = n;
+    }
 
-    VNF_TRACE(st, "GetEncodePresetGUIDs -> %u of %u slots", n, guidArraySize);
-    *encodePresetGUIDCount = n;
+    char who[160];
+    vnf_caller(who, sizeof(who), _ReturnAddress());
+    vnf_log(1, "GetEncodePresetGUIDs(%s, room=%u) -> %s, driver=%u returned=%u (+%d legacy)  [from %s]",
+            vnf_codec_name(&encodeGUID), guidArraySize, vnf_status(st),
+            fromDriver, n, appended, who);
+    if (appended < VNF_MAP_COUNT && st == NV_ENC_SUCCESS && presetGUIDs)
+        vnf_log(1, "    WARNING: caller's array held only %u slots - %d legacy preset(s) did not fit",
+                guidArraySize, VNF_MAP_COUNT - appended);
     return st;
 }
 
