@@ -8,7 +8,6 @@ Symptoms this fixes:
 
 * Rendering with **Encode mode: NV Encoder** fails instantly
 * The **Preset** dropdown in Custom Settings is **empty**
-* CPU / MainConcept rendering still works fine
 
 > NVIDIA removed the legacy NVENC encode presets in the R590 driver branch, on
 > purpose. VEGAS Pro 17–22 ask for those presets and nothing else, so the encoder
