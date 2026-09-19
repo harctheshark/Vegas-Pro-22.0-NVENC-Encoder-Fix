@@ -68,7 +68,7 @@
 #include "nvenc_deprecated_presets.h"
 #include "nvenc_preset_map.h"
 
-#define VNF_VERSION "1.2.0"
+#define VNF_VERSION "1.3.0"
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
@@ -305,8 +305,19 @@ static NVENCSTATUS NVENCAPI vnf_OpenEncodeSessionEx(NV_ENC_OPEN_ENCODE_SESSION_E
     NVENCSTATUS st = g_real.nvEncOpenEncodeSessionEx(p, encoder);
     vnf_ver_restore(&v);
 
-    VNF_TRACE(st, "OpenEncodeSessionEx: struct ver 0x%08X -> 0x%08X : %s",
-              was, (unsigned)NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER, vnf_status(st));
+    // deviceType matters: mxavcaacplug.dll has both a DirectX path (it imports
+    // d3d9/dxva2) and a CUDA path (cuInit/cuCtxCreate). Knowing which one a
+    // given session used says which of those two code paths is live.
+    const char *dev = "?";
+    if (p) switch (p->deviceType) {
+        case NV_ENC_DEVICE_TYPE_DIRECTX: dev = "DIRECTX"; break;
+        case NV_ENC_DEVICE_TYPE_CUDA:    dev = "CUDA";    break;
+        case NV_ENC_DEVICE_TYPE_OPENGL:  dev = "OPENGL";  break;
+        default:                         dev = "other";   break;
+    }
+    vnf_log(1, "OpenEncodeSessionEx: device=%s apiVersion=0x%08X struct 0x%08X -> 0x%08X : %s",
+            dev, p ? p->apiVersion : 0, was,
+            (unsigned)NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER, vnf_status(st));
     return st;
 }
 

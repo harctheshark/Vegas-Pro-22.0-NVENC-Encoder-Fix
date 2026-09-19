@@ -80,6 +80,11 @@ echo === building nvenc_whichdll.exe ===
 cl %CFLAGS% tools\nvenc_whichdll.c /Fe:build\nvenc_whichdll.exe /Fo:build\ /Fd:build\
 if errorlevel 1 goto :fail
 
+echo.
+echo === building dbgcapture.exe ===
+cl %CFLAGS% tools\dbgcapture.c /Fe:build\dbgcapture.exe /Fo:build\ /Fd:build\ /link advapi32.lib
+if errorlevel 1 goto :fail
+
 :done
 echo.
 echo === build complete -^> %ROOT%\build ===
