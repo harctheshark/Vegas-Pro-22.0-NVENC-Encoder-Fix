@@ -275,6 +275,23 @@ InitializeEncoder: preset HQ -> P4 tuning=1 (1920x1080, params ver 0xF107000D)
 
 ## Troubleshooting
 
+**`0x80660008` specifically — invalid parameter, raised before NVENC is called.**
+The shim log shows `OpenEncodeSessionEx` succeeding, `DestroyEncoder` right
+after, and no preset or init call in between. The encoder opened fine and the
+plugin then rejected the configuration itself. Two settings cause this:
+
+1. **A 10-bit pixel format with H.264.** The plugin refuses that combination
+   outright (`NvHWEncoder.cpp` line 755). Check **File → Properties → Video →
+   Pixel format** and set it to **8-bit**; "32-bit floating point" makes VEGAS
+   work in high bit depth and can push a 10-bit format at the encoder. Switching
+   the render to HEVC also sidesteps this check, since HEVC does support 10-bit.
+2. **A frame larger than the encoder's configured maximum.** In the render
+   template's Custom Settings, make the frame size match the project exactly and
+   untick *Allow source to adjust frame size*.
+
+To find out which, capture the plugin's own message with
+`scripts\run-vegas-traced.ps1` and look for a `NvHWEncoder.cpp` line.
+
 **The Preset list is empty and NVENC renders fail, but the shim log shows a
 successful `OpenEncodeSessionEx` followed by `DestroyEncoder` and nothing else.**
 That pattern means NVENC is healthy and VEGAS is choosing not to use it. The
