@@ -239,6 +239,32 @@ InitializeEncoder: preset HQ -> P4 tuning=1 (1920x1080, params ver 0xF107000D)
 
 ## Troubleshooting
 
+**The Preset list is empty and NVENC renders fail, but the shim log shows a
+successful `OpenEncodeSessionEx` followed by `DestroyEncoder` and nothing else.**
+That pattern means NVENC is healthy and VEGAS is choosing not to use it. The
+usual cause is a second GPU: on a machine with an integrated Radeon or Intel
+adapter driving the primary display, Windows hands VEGAS the iGPU, and VEGAS
+will not offer the NVIDIA encoder for a non-NVIDIA render device. Check what
+VEGAS detected — its own telemetry reports the adapter, and so does:
+
+```powershell
+Get-CimInstance Win32_VideoController |
+  Select-Object Name, CurrentHorizontalResolution
+```
+
+An adapter with a non-null resolution is driving a display. If the integrated
+one is on your primary monitor, fix it in this order:
+
+1. Settings → System → Display → **Graphics** → Add desktop app →
+   `vegas220.exe` → Options → **High performance** (the NVIDIA card).
+2. VEGAS → Options → Preferences → **Video** → *GPU acceleration of video
+   processing* → select the NVIDIA card. Restart VEGAS.
+3. Most robust: move the primary monitor's cable to the NVIDIA card.
+
+This is a separate problem from the one this shim fixes, and both have to be
+resolved: the GPU selection is what lets VEGAS attempt NVENC at all, and the
+shim is what makes the attempt succeed once it does.
+
 **Still failing, and the log file does not exist.** The shim was never loaded.
 Confirm `nvEncodeAPI64.dll` sits in the same folder as `vegas220.exe`, not in a
 plug-in subfolder — the loader searches the *executable's* directory. Copy
