@@ -71,6 +71,11 @@ cl %CFLAGS% tools\nvenc_verify.c /Fe:build\nvenc_verify.exe /Fo:build\ /Fd:build
 if errorlevel 1 goto :fail
 
 echo.
+echo === building nvenc_probe71.exe ===
+cl %CFLAGS% tools\nvenc_probe71.c /Fe:build\nvenc_probe71.exe /Fo:build\ /Fd:build\ /link d3d11.lib
+if errorlevel 1 goto :fail
+
+echo.
 echo === building nvenc_whichdll.exe ===
 cl %CFLAGS% tools\nvenc_whichdll.c /Fe:build\nvenc_whichdll.exe /Fo:build\ /Fd:build\
 if errorlevel 1 goto :fail

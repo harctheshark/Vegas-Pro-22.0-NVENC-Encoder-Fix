@@ -1,12 +1,17 @@
-// nvenc_verify - end-to-end proof that the shim repairs the legacy preset path.
+// nvenc_verify - end-to-end proof that the shim repairs VEGAS's NVENC path.
 //
-// Usage: nvenc_verify.exe [path\to\nvEncodeAPI64.dll]
-//   With no argument it loads the system DLL, which is expected to FAIL on a
-//   driver that dropped the legacy presets. Point it at the built shim and the
-//   same sequence is expected to PASS.
+// Usage: nvenc_verify.exe [path\to\nvEncodeAPI64.dll] [--as71]
+//   With no DLL argument it loads the system DLL, which is expected to FAIL on
+//   an affected driver. Point it at the built shim and the same sequence is
+//   expected to PASS.
 //
-// The test deliberately mirrors what VEGAS does:
-//   nvEncGetEncodePresetConfig(H.264, NV_ENC_PRESET_HQ_GUID)
+//   --as71 impersonates VEGAS exactly: it declares itself an NVENC API 7.1
+//   client and stamps every struct with 7.1-era versions, which is what
+//   mxavcaacplug.dll does. Current drivers reject those stamps outright, so
+//   this mode fails at nvEncOpenEncodeSessionEx against the raw driver.
+//
+// The sequence deliberately mirrors VEGAS:
+//   open session -> nvEncGetEncodePresetConfig(H.264, NV_ENC_PRESET_HQ_GUID)
 //     -> nvEncInitializeEncoder(presetGUID = NV_ENC_PRESET_HQ_GUID)
 //     -> encode real frames and read back a bitstream.
 
@@ -15,6 +20,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "nvEncodeAPI.h"
 #include "../src/nvenc_deprecated_presets.h"
@@ -26,6 +32,26 @@
 typedef NVENCSTATUS(NVENCAPI *PFN_CREATE_INSTANCE)(NV_ENCODE_API_FUNCTION_LIST *);
 
 static int g_failures = 0;
+static int g_as71     = 0;   // impersonate an SDK 7.1 client
+
+// SDK 7.1 version stamps. Struct indices come from the SDK 8.0 header (the
+// oldest published); the function-list index is confirmed correct because
+// 0x71020007 is byte-for-byte what VEGAS sends.
+#define V71_API        ((uint32_t)(7u | (1u << 24)))
+#define V71_S(n)       ((uint32_t)(V71_API | ((n) << 16) | (0x7u << 28)))
+#define V71_FUNCLIST   V71_S(2)
+#define V71_OPEN       V71_S(1)
+#define V71_PRESET_CFG (V71_S(4) | (1u << 31))
+#define V71_CONFIG     (V71_S(6) | (1u << 31))
+#define V71_INIT       (V71_S(5) | (1u << 31))
+#define V71_CREATE_IN  V71_S(1)
+#define V71_CREATE_BS  V71_S(1)
+#define V71_PIC        (V71_S(4) | (1u << 31))
+#define V71_LOCK_BS    V71_S(1)
+#define V71_LOCK_IN    V71_S(1)
+
+// Pick the stamp appropriate to the client we are pretending to be.
+#define VER(modern, legacy) (g_as71 ? (uint32_t)(legacy) : (uint32_t)(modern))
 
 static void check(const char *what, NVENCSTATUS st)
 {
@@ -40,16 +66,21 @@ static void check(const char *what, NVENCSTATUS st)
 int main(int argc, char **argv)
 {
     char dllPath[MAX_PATH];
-    if (argc > 1) {
-        snprintf(dllPath, sizeof(dllPath), "%s", argv[1]);
-    } else {
+    dllPath[0] = '\0';
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--as71") == 0) g_as71 = 1;
+        else snprintf(dllPath, sizeof(dllPath), "%s", argv[i]);
+    }
+    if (!dllPath[0]) {
         char sys[MAX_PATH];
         GetSystemDirectoryA(sys, MAX_PATH);
         snprintf(dllPath, sizeof(dllPath), "%s\\nvEncodeAPI64.dll", sys);
     }
 
     printf("=== nvenc_verify ===\n");
-    printf("DLL under test: %s\n\n", dllPath);
+    printf("DLL under test: %s\n", dllPath);
+    printf("client profile: %s\n\n",
+           g_as71 ? "SDK 7.1 (impersonating VEGAS mxavcaacplug)" : "current SDK");
 
     HMODULE lib = LoadLibraryA(dllPath);
     if (!lib) { printf("FATAL: LoadLibrary failed (err %lu)\n", GetLastError()); return 2; }
@@ -60,7 +91,7 @@ int main(int argc, char **argv)
 
     NV_ENCODE_API_FUNCTION_LIST api;
     memset(&api, 0, sizeof(api));
-    api.version = NV_ENCODE_API_FUNCTION_LIST_VER;
+    api.version = VER(NV_ENCODE_API_FUNCTION_LIST_VER, V71_FUNCLIST);
     NVENCSTATUS st = create(&api);
     if (st != NV_ENC_SUCCESS) { printf("FATAL: CreateInstance -> %d\n", (int)st); return 2; }
 
@@ -73,21 +104,27 @@ int main(int argc, char **argv)
 
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS op;
     memset(&op, 0, sizeof(op));
-    op.version    = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
+    op.version    = VER(NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER, V71_OPEN);
     op.deviceType = NV_ENC_DEVICE_TYPE_DIRECTX;
     op.device     = dev;
-    op.apiVersion = NVENCAPI_VERSION;
+    op.apiVersion = VER(NVENCAPI_VERSION, V71_API);
 
     void *enc = NULL;
+    printf("[0] opening an encode session\n");
     st = api.nvEncOpenEncodeSessionEx(&op, &enc);
-    if (st != NV_ENC_SUCCESS) { printf("FATAL: OpenEncodeSessionEx -> %d\n", (int)st); return 2; }
+    check("nvEncOpenEncodeSessionEx", st);
+    if (st != NV_ENC_SUCCESS) {
+        printf("\n  The driver rejected this client's struct version stamps.\n");
+        printf("  RESULT: BROKEN (%d failure(s))\n", g_failures);
+        return 1;
+    }
 
     // --- 1. the call that VEGAS fails on --------------------------------
     printf("[1] legacy preset config (the call VEGAS makes)\n");
     NV_ENC_PRESET_CONFIG pc;
     memset(&pc, 0, sizeof(pc));
-    pc.version           = NV_ENC_PRESET_CONFIG_VER;
-    pc.presetCfg.version = NV_ENC_CONFIG_VER;
+    pc.version           = VER(NV_ENC_PRESET_CONFIG_VER, V71_PRESET_CFG);
+    pc.presetCfg.version = VER(NV_ENC_CONFIG_VER, V71_CONFIG);
     st = api.nvEncGetEncodePresetConfig(enc, NV_ENC_CODEC_H264_GUID,
                                         VNF_NV_ENC_PRESET_HQ_GUID, &pc);
     check("nvEncGetEncodePresetConfig(H.264, NV_ENC_PRESET_HQ_GUID)", st);
@@ -123,7 +160,7 @@ int main(int argc, char **argv)
 
     NV_ENC_INITIALIZE_PARAMS init;
     memset(&init, 0, sizeof(init));
-    init.version       = NV_ENC_INITIALIZE_PARAMS_VER;
+    init.version       = VER(NV_ENC_INITIALIZE_PARAMS_VER, V71_INIT);
     init.encodeGUID    = NV_ENC_CODEC_H264_GUID;
     init.presetGUID    = VNF_NV_ENC_PRESET_HQ_GUID;   // legacy GUID on purpose
     init.encodeWidth   = WIDTH;
@@ -144,7 +181,7 @@ int main(int argc, char **argv)
     printf("\n[4] encoding %d frames\n", FRAMES);
     NV_ENC_CREATE_INPUT_BUFFER inb;
     memset(&inb, 0, sizeof(inb));
-    inb.version   = NV_ENC_CREATE_INPUT_BUFFER_VER;
+    inb.version   = VER(NV_ENC_CREATE_INPUT_BUFFER_VER, V71_CREATE_IN);
     inb.width     = WIDTH;
     inb.height    = HEIGHT;
     inb.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
@@ -153,7 +190,7 @@ int main(int argc, char **argv)
 
     NV_ENC_CREATE_BITSTREAM_BUFFER outb;
     memset(&outb, 0, sizeof(outb));
-    outb.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+    outb.version = VER(NV_ENC_CREATE_BITSTREAM_BUFFER_VER, V71_CREATE_BS);
     st = api.nvEncCreateBitstreamBuffer(enc, &outb);
     check("nvEncCreateBitstreamBuffer", st);
     if (g_failures) { printf("\n  RESULT: BROKEN\n"); return 1; }
@@ -163,7 +200,7 @@ int main(int argc, char **argv)
     for (int f = 0; f < FRAMES; f++) {
         NV_ENC_LOCK_INPUT_BUFFER lk;
         memset(&lk, 0, sizeof(lk));
-        lk.version     = NV_ENC_LOCK_INPUT_BUFFER_VER;
+        lk.version     = VER(NV_ENC_LOCK_INPUT_BUFFER_VER, V71_LOCK_IN);
         lk.inputBuffer = inb.inputBuffer;
         if (api.nvEncLockInputBuffer(enc, &lk) != NV_ENC_SUCCESS) { g_failures++; break; }
 
@@ -179,7 +216,7 @@ int main(int argc, char **argv)
 
         NV_ENC_PIC_PARAMS pic;
         memset(&pic, 0, sizeof(pic));
-        pic.version         = NV_ENC_PIC_PARAMS_VER;
+        pic.version         = VER(NV_ENC_PIC_PARAMS_VER, V71_PIC);
         pic.inputBuffer     = inb.inputBuffer;
         pic.outputBitstream = outb.bitstreamBuffer;
         pic.bufferFmt       = NV_ENC_BUFFER_FORMAT_NV12;
@@ -196,7 +233,7 @@ int main(int argc, char **argv)
 
         NV_ENC_LOCK_BITSTREAM lb;
         memset(&lb, 0, sizeof(lb));
-        lb.version         = NV_ENC_LOCK_BITSTREAM_VER;
+        lb.version         = VER(NV_ENC_LOCK_BITSTREAM_VER, V71_LOCK_BS);
         lb.outputBitstream = outb.bitstreamBuffer;
         if (api.nvEncLockBitstream(enc, &lb) == NV_ENC_SUCCESS) {
             total += lb.bitstreamSizeInBytes;
@@ -208,7 +245,7 @@ int main(int argc, char **argv)
     // Flush.
     NV_ENC_PIC_PARAMS eos;
     memset(&eos, 0, sizeof(eos));
-    eos.version         = NV_ENC_PIC_PARAMS_VER;
+    eos.version         = VER(NV_ENC_PIC_PARAMS_VER, V71_PIC);
     eos.encodePicFlags  = NV_ENC_PIC_FLAG_EOS;
     api.nvEncEncodePicture(enc, &eos);
 

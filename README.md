@@ -42,7 +42,7 @@ From `nvenc_probe.exe` on driver 616.92 / RTX 4090 (`tools/nvenc_probe.c`):
 
 ```
 driver max supported version      : 13.1
-NvEncodeAPICreateInstance          -> SUCCESS for every SDK 9.0 .. 13.1
+NvEncodeAPICreateInstance          -> SUCCESS for every SDK 7.0 .. 13.1
 nvEncGetEncodePresetConfig         -> still a valid, non-NULL pointer
 presets enumerated for H.264       -> 7   (P1..P7 only, no legacy presets)
 
@@ -51,8 +51,37 @@ nvEncGetEncodePresetConfigEx(P1..P7, tuning)    -> SUCCESS
 ```
 
 So the entry point is fine and the function pointer is fine. Only the *preset
-identity* is no longer recognised. That is a translation problem, and translation
-is all this shim does.
+identity* is no longer recognised.
+
+### Why translation alone is not enough
+
+`mxavcaacplug.dll` drives NVENC as an **SDK 7.1 client** — it sends function-list
+version `0x71020007` and stamps every API struct with 7.1-era versions. That
+matters because the replacement API refuses those stamps
+(`tools/nvenc_probe71.c`):
+
+```
+nvEncGetEncodePresetConfigEx, 7.1-stamped structs  -> ERR_INVALID_VERSION
+nvEncGetEncodePresetConfigEx, current stamps       -> SUCCESS
+```
+
+So a shim that only swapped the preset GUID would still fail: the translated call
+would be rejected for its version stamp instead. The shim therefore also uplifts
+struct versions. Crossing the two version fields shows that only
+`NV_ENC_*::version` is checked, not `apiVersion`:
+
+| `op.version` | `op.apiVersion` | `nvEncOpenEncodeSessionEx` |
+|---|---|---|
+| 13.1 | 13.1 | SUCCESS |
+| 13.1 | 7.1 | SUCCESS |
+| 7.1 | 13.1 | `ERR_INVALID_VERSION` |
+
+> **A measurement trap worth recording.** The driver latches a client API version
+> per *process* at `NvEncodeAPICreateInstance`. A probe that creates a current
+> -version instance first will then see 7.1 stamps rejected everywhere and
+> conclude, wrongly, that old clients are locked out entirely. Run the old-client
+> test before any newer instance exists — `nvenc_probe71.c` section `[1b]` does,
+> and shows a 7.1 session opening fine. The only genuine break is the presets.
 
 ---
 
@@ -61,15 +90,23 @@ is all this shim does.
 `nvEncodeAPI64.dll` in the VEGAS program folder is found by the loader ahead of
 `%SystemRoot%\System32` (the application directory precedes the system directory
 in the standard search order). The shim forwards every call to the genuine driver
-DLL, loaded by absolute System32 path, and repairs three things:
+DLL, loaded by absolute System32 path, and repairs two things:
 
-1. **`nvEncGetEncodePresetConfig`** — if the driver rejects a legacy preset GUID,
-   retries through `nvEncGetEncodePresetConfigEx` using the P1–P7 preset and
-   tuning info that NVIDIA's own migration guide designates as equivalent.
-2. **`nvEncGetEncodePresetCount` / `nvEncGetEncodePresetGUIDs`** — re-advertises
-   the legacy presets, so callers that enumerate before choosing still see them.
-3. **`nvEncInitializeEncoder`** — rewrites a legacy `presetGUID` in the init
-   params, since the driver rejects it there too.
+1. **Version uplift.** Every NVENC struct begins with a `uint32_t version`. On
+   the way in the shim overwrites it with the stamp this build understands, and
+   restores the caller's original on the way out, so the caller's memory is
+   returned exactly as it was handed over. This is safe because NVENC structs are
+   fixed size across SDK revisions — the function list is 317 pointer slots in
+   SDK 8.0, 11.1 and 13.1 alike — so new fields are carved from trailing reserved
+   space an older client has already zeroed, and zero is the documented default.
+   `tuningInfo`, which a pre-SDK-10 client never sets and for which zero is
+   invalid, is filled in explicitly.
+
+2. **Preset translation.** A removed legacy preset GUID is mapped to the P1–P7
+   preset and tuning info NVIDIA's migration guide calls equivalent, and fetched
+   through `nvEncGetEncodePresetConfigEx`. The legacy GUIDs are also
+   re-advertised by `nvEncGetEncodePresetCount` / `...GUIDs`, and rewritten in
+   `nvEncInitializeEncoder`.
 
 Everything else passes through untouched, including all eight undocumented
 `NvTool*` exports, forwarded in assembly so that any signature survives intact.
@@ -145,28 +182,28 @@ Set `VEGAS_NVENC_FIX_DISABLE=1`. The shim becomes a pure pass-through.
 
 ## Verify
 
-`nvenc_verify.exe` runs the exact sequence VEGAS uses — legacy preset config,
-encoder init with a legacy preset, then ten real encoded frames.
+`nvenc_verify.exe` runs the exact sequence VEGAS uses — open session, legacy
+preset config, encoder init with a legacy preset, then ten real encoded frames.
+`--as71` impersonates VEGAS precisely, declaring an SDK 7.1 client and stamping
+every struct the way `mxavcaacplug.dll` does.
 
 ```bat
-build\nvenc_verify.exe
-build\nvenc_verify.exe build\nvEncodeAPI64.dll
+build\nvenc_verify.exe                              :: raw driver, modern client
+build\nvenc_verify.exe --as71                       :: raw driver, as VEGAS
+build\nvenc_verify.exe build\nvEncodeAPI64.dll      :: shim, modern client
+build\nvenc_verify.exe build\nvEncodeAPI64.dll --as71  :: shim, as VEGAS
 ```
 
-On an affected driver the first is expected to fail and the second to pass:
+On an affected driver:
 
-```
-A) system DLL                          B) the shim
-[1] legacy preset config               [1] legacy preset config
-  [FAIL] ... (status 12)                 [ ok ] ...
-                                       [2] preset enumeration
-  RESULT: BROKEN                         [ ok ] 16 presets, legacy HQ present
-                                       [3] encoder initialisation
-                                         [ ok ] ...
-                                       [4] encoding 10 frames
-                                         [ ok ] 10 frames, 1684 bytes
-                                       RESULT: WORKING
-```
+| Case | Result | First failure |
+|---|---|---|
+| raw driver, modern client | BROKEN | `nvEncGetEncodePresetConfig` status 12 |
+| raw driver, VEGAS 7.1 | BROKEN | `nvEncGetEncodePresetConfig` status 12 |
+| **shim, modern client** | **WORKING** | — |
+| **shim, VEGAS 7.1** | **WORKING** | — |
+
+A passing run ends with 10 frames and a non-empty H.264 bitstream.
 
 `nvenc_probe.exe` dumps the full driver capability picture and is the right thing
 to attach to a bug report.
@@ -191,6 +228,7 @@ InitializeEncoder: preset HQ -> P4 tuning=1 (1920x1080, params ver 0xF107000D)
 | `VEGAS_NVENC_FIX_LOG` | `0` off, `1` normal (default), `2` verbose |
 | `VEGAS_NVENC_FIX_DISABLE` | `1` = pure pass-through |
 | `VEGAS_NVENC_FIX_ENUM` | `0` = do not re-advertise legacy presets |
+| `VEGAS_NVENC_FIX_UPLIFT` | `0` = do not rewrite struct version stamps |
 
 ---
 
@@ -251,6 +289,7 @@ src/nvenc_thunks.asm             register-exact NvTool* forwarders
 src/nvenc_shim.def               export surface, ordinals pinned to the driver's
 tools/nvenc_probe.c              driver capability probe
 tools/nvenc_verify.c             end-to-end pass/fail test
+tools/nvenc_probe71.c            what the driver does for an SDK 7.1 client
 tools/nvenc_whichdll.c           shows which nvEncodeAPI64.dll the loader picks
 scripts/build.cmd                MSVC build
 scripts/install.ps1              install, with backup + manifest
